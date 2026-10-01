@@ -21,6 +21,12 @@ BOOL WINAPI OnConsoleCtrl(DWORD type) {
         case CTRL_C_EVENT:
         case CTRL_BREAK_EVENT:
         case CTRL_CLOSE_EVENT:
+            // TODO(Task 6): once standalone mode has real cleanup (listeners, connections,
+            // the rules file), CTRL_CLOSE_EVENT must not just signal and return: Windows
+            // ends the process as soon as the handler returns from a close event, so the
+            // handler has to WAIT -- bounded, well inside the ~5 s the system grants -- for
+            // main to report that shutdown has finished. Ctrl+C/Break may keep returning
+            // at once; the process carries on running main in that case.
             if (g_consoleStop) SetEvent(g_consoleStop);
             return TRUE;
         default:

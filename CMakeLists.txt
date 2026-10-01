@@ -27,7 +27,19 @@ string(JSON PF_PLUGIN_ID ERROR_VARIABLE PF_JSON_ERR GET "${PF_MANIFEST_TEXT}" id
 if(PF_JSON_ERR)
   message(FATAL_ERROR "manifest.json: cannot read 'id': ${PF_JSON_ERR}")
 endif()
-if(NOT PF_VERSION MATCHES "^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+# "[.]", never "\." -- inside a quoted CMake argument "\." is an escape for a plain ".",
+# which the regex then reads as "any character", so "1x0x0" and "100.0" would pass.
+set(PF_VERSION_REGEX "^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$")
+# Self-check of the regex itself, so a future edit cannot quietly reopen that hole.
+foreach(bad IN ITEMS "1x0x0" "100.0" "1.0" "1.0.0.0" "01.0.0" "1.0.0-rc1" "v1.0.0")
+  if(bad MATCHES "${PF_VERSION_REGEX}")
+    message(FATAL_ERROR "CMakeLists.txt: PF_VERSION_REGEX accepts '${bad}'")
+  endif()
+endforeach()
+if(NOT "1.0.0" MATCHES "${PF_VERSION_REGEX}")
+  message(FATAL_ERROR "CMakeLists.txt: PF_VERSION_REGEX rejects '1.0.0'")
+endif()
+if(NOT PF_VERSION MATCHES "${PF_VERSION_REGEX}")
   message(FATAL_ERROR "manifest.json: 'version' must be three numeric parts, got '${PF_VERSION}'")
 endif()
 set(PF_VERSION_MAJOR ${CMAKE_MATCH_1})
@@ -46,7 +58,7 @@ configure_file(src/version.rc.in "${PF_GEN_DIR}/version.rc" @ONLY)
 
 # ---- Compiler and linker flags ---------------------------------------------------
 add_compile_options(
-  "$<$<COMPILE_LANGUAGE:CXX>:/W4;/permissive-;/utf-8;/guard:cf;/EHsc;/Zc:__cplusplus>")
+  "$<$<COMPILE_LANGUAGE:CXX>:/W4;/WX;/permissive-;/utf-8;/guard:cf;/EHsc;/Zc:__cplusplus>")
 add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00
                         JSON_USE_IMPLICIT_CONVERSIONS=0)
 add_link_options(/guard:cf /CETCOMPAT)

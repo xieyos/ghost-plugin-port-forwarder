@@ -32,7 +32,7 @@ inline std::string WideToUtf8(const std::wstring& w) {
     return s;
 }
 
-// Reads an environment variable through the W API. Returns false when the variable
+// Reads an environment variable through the W API. Returns false only when the variable
 // does not exist; an existing but empty variable is "present" with an empty value.
 inline bool GetEnvUtf8(const wchar_t* name, std::string* value) {
     SetLastError(ERROR_SUCCESS);
@@ -44,6 +44,7 @@ inline bool GetEnvUtf8(const wchar_t* name, std::string* value) {
     }
     std::wstring buf(n, L'\0');
     for (int attempt = 0; attempt < 4; ++attempt) {
+        SetLastError(ERROR_SUCCESS);
         const DWORD got = GetEnvironmentVariableW(name, buf.data(), static_cast<DWORD>(buf.size()));
         if (got == 0) {
             if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) return false;
@@ -57,7 +58,11 @@ inline bool GetEnvUtf8(const wchar_t* name, std::string* value) {
         }
         buf.assign(got, L'\0');  // grew between the two calls
     }
-    return false;
+    // It kept growing under us. It exists -- and existence is the answer that matters
+    // (GHOST_PLUGIN_ID decides hosted vs standalone, which must never flip because of a
+    // race) -- so answer true with whatever the last read left, up to its first NUL.
+    if (value) *value = WideToUtf8(std::wstring(buf.c_str()));
+    return true;
 }
 
 }  // namespace pf

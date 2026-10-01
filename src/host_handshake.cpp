@@ -49,6 +49,39 @@ bool IsTokenShaped(const std::string& s) {
     return true;
 }
 
+bool HasControlChar(const std::string& s) {
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F) return true;
+    }
+    return false;
+}
+
+bool IsAbsoluteWindowsPath(const std::string& s) {
+    if (s.size() >= 3 && ((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z')) && s[1] == ':' &&
+        s[2] == '\\') {
+        return true;
+    }
+    return s.size() >= 3 && s[0] == '\\' && s[1] == '\\';
+}
+
+namespace {
+
+bool IsLangShaped(const std::string& s) {
+    if (s.empty() || s.size() > kMaxLangChars) return false;
+    for (unsigned char c : s) {
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' ||
+                        c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool IsDirShaped(const std::string& s) {
+    return !s.empty() && !HasControlChar(s) && IsAbsoluteWindowsPath(s);
+}
+
+}  // namespace
+
 std::string ParseHandshake(const std::string& line, const HostEnv& env, Handshake* out) {
     const json j = ParseJsonNoThrow(line);
     if (!j.is_object()) return "bad_json";
@@ -61,13 +94,15 @@ std::string ParseHandshake(const std::string& line, const HostEnv& env, Handshak
         hs.pluginId != env.pluginId) {
         return "bad_plugin_id";
     }
-    if (!JsonGetString(j, "pluginDir", &hs.pluginDir) || hs.pluginDir.empty()) return "bad_plugin_dir";
-    if (!JsonGetString(j, "dataDir", &hs.dataDir) || hs.dataDir.empty()) return "bad_data_dir";
+    if (!JsonGetString(j, "pluginDir", &hs.pluginDir) || !IsDirShaped(hs.pluginDir)) return "bad_plugin_dir";
+    if (!JsonGetString(j, "dataDir", &hs.dataDir) || !IsDirShaped(hs.dataDir)) return "bad_data_dir";
     if (!JsonGetString(j, "apiBase", &hs.apiBase) || !ParseApiBase(hs.apiBase, &hs.apiPort)) return "bad_api_base";
     if (!JsonGetString(j, "token", &hs.token) || !IsTokenShaped(hs.token)) return "bad_token";
     if (!JsonGetStringArray(j, "permissions", &hs.permissions)) return "bad_permissions";
-    if (j.contains("lang") && !JsonGetString(j, "lang", &hs.lang)) return "bad_lang";
-    if (!JsonGetString(j, "stopEvent", &hs.stopEvent) || hs.stopEvent.empty()) return "bad_stop_event";
+    if (j.contains("lang") && (!JsonGetString(j, "lang", &hs.lang) || !IsLangShaped(hs.lang))) return "bad_lang";
+    if (!JsonGetString(j, "stopEvent", &hs.stopEvent) || hs.stopEvent.empty() || HasControlChar(hs.stopEvent)) {
+        return "bad_stop_event";
+    }
     if (env.hasStopEvent && hs.stopEvent != env.stopEvent) return "bad_stop_event";
 
     if (out) *out = std::move(hs);
@@ -103,7 +138,7 @@ LineResult ReadLine(HANDLE h, size_t maxBytes, std::string* line) {
 
 std::string ReadHandshake(HANDLE in, const HostEnv& env, Handshake* out) {
     std::string line;
-    switch (ReadLine(in, kMaxHandshakeLineBytes, &line)) {
+    switch (ReadLine(in, kMaxHostLineBytes, &line)) {
         case LineResult::Ok: break;
         case LineResult::TooLong: return "line_too_long";
         case LineResult::Eof:
@@ -131,7 +166,7 @@ std::string FormatReceiptOk(const std::string& uiUrl) {
     j["ok"] = true;
     if (!uiUrl.empty()) j["uiUrl"] = uiUrl;
     std::string line = DumpSafe(j) + "\n";
-    if (line.size() > kMaxReceiptLineBytes) {
+    if (line.size() > kMaxHandshakeLineBytes) {
         // A uiUrl this long would be dropped by the host; answer without one rather than
         // break the line limit.
         line = "{\"v\":1,\"ok\":true}\n";
@@ -147,10 +182,10 @@ std::string FormatReceiptError(const std::string& error) {
         j["ok"] = false;
         j["error"] = text;
         std::string line = DumpSafe(j) + "\n";
-        if (line.size() <= kMaxReceiptLineBytes || text.empty()) return line;
+        if (line.size() <= kMaxHandshakeLineBytes || text.empty()) return line;
         // Escaping can make the line longer than the text; shrink by the overflow (at
         // least one byte) and try again.
-        const size_t over = line.size() - kMaxReceiptLineBytes;
+        const size_t over = line.size() - kMaxHandshakeLineBytes;
         const size_t keep = text.size() > over ? text.size() - over : 0;
         text.resize(Utf8PrefixLen(text, keep));
     }

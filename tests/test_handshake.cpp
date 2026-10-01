@@ -75,6 +75,23 @@ void RunRows() {
         {"dataDir missing", [](json& j, HostEnv&) { j.erase("dataDir"); }, "bad_data_dir"},
         {"dataDir empty", [](json& j, HostEnv&) { j["dataDir"] = ""; }, "bad_data_dir"},
         {"dataDir an array", [](json& j, HostEnv&) { j["dataDir"] = json::array({"C:\\x"}); }, "bad_data_dir"},
+        // ...absolute Windows paths ("X:\" or "\\"), no control characters. Each row keeps
+        // the path absolute unless absoluteness is the point, and vice versa.
+        {"pluginDir embedded NUL", [](json& j, HostEnv&) { j["pluginDir"] = std::string("C:\\plugins\0\\x", 13); }, "bad_plugin_dir"},
+        {"pluginDir LF", [](json& j, HostEnv&) { j["pluginDir"] = "C:\\plugins\n\\x"; }, "bad_plugin_dir"},
+        {"pluginDir 0x1F", [](json& j, HostEnv&) { j["pluginDir"] = "C:\\plugins\x1f\\x"; }, "bad_plugin_dir"},
+        {"pluginDir 0x7F", [](json& j, HostEnv&) { j["pluginDir"] = "C:\\plugins\x7f\\x"; }, "bad_plugin_dir"},
+        {"pluginDir relative", [](json& j, HostEnv&) { j["pluginDir"] = "plugins\\x"; }, "bad_plugin_dir"},
+        {"pluginDir drive-relative", [](json& j, HostEnv&) { j["pluginDir"] = "C:plugins\\x"; }, "bad_plugin_dir"},
+        {"pluginDir rooted, no drive", [](json& j, HostEnv&) { j["pluginDir"] = "\\plugins\\x"; }, "bad_plugin_dir"},
+        {"pluginDir forward slash", [](json& j, HostEnv&) { j["pluginDir"] = "C:/plugins/x"; }, "bad_plugin_dir"},
+        {"pluginDir digit drive", [](json& j, HostEnv&) { j["pluginDir"] = "1:\\plugins\\x"; }, "bad_plugin_dir"},
+        {"pluginDir UNC", [](json& j, HostEnv&) { j["pluginDir"] = "\\\\server\\share\\plugins\\x"; }, ""},
+        {"pluginDir \\\\?\\", [](json& j, HostEnv&) { j["pluginDir"] = "\\\\?\\C:\\plugins\\x"; }, ""},
+        {"pluginDir lower-case drive", [](json& j, HostEnv&) { j["pluginDir"] = "d:\\plugins\\x"; }, ""},
+        {"dataDir embedded NUL", [](json& j, HostEnv&) { j["dataDir"] = std::string("C:\\data\0\\x", 10); }, "bad_data_dir"},
+        {"dataDir tab", [](json& j, HostEnv&) { j["dataDir"] = "C:\\data\t\\x"; }, "bad_data_dir"},
+        {"dataDir relative", [](json& j, HostEnv&) { j["dataDir"] = ".data"; }, "bad_data_dir"},
         // apiBase: exactly http://127.0.0.1:<1..65535>.
         {"apiBase https", [](json& j, HostEnv&) { j["apiBase"] = "https://127.0.0.1:23551"; }, "bad_api_base"},
         {"apiBase HTTP upper case", [](json& j, HostEnv&) { j["apiBase"] = "HTTP://127.0.0.1:23551"; }, "bad_api_base"},
@@ -91,7 +108,9 @@ void RunRows() {
         {"apiBase trailing slash", [](json& j, HostEnv&) { j["apiBase"] = "http://127.0.0.1:2355/"; }, "bad_api_base"},
         {"apiBase with a path", [](json& j, HostEnv&) { j["apiBase"] = "http://127.0.0.1:23/a"; }, "bad_api_base"},
         {"apiBase trailing slash, 5-digit port", [](json& j, HostEnv&) { j["apiBase"] = "http://127.0.0.1:23551/"; }, "bad_api_base"},
-        {"apiBase port sign", [](json& j, HostEnv&) { j["apiBase"] = "http://127.0.0.1:+2355"; }, "bad_api_base"},
+        // 2^32 + 23551: only the length guard stops a 32-bit accumulator wrapping to 23551.
+        {"apiBase port 2^32 + 23551", [](json& j, HostEnv&) { j["apiBase"] = "http://127.0.0.1:4294990847"; }, "bad_api_base"},
+        {"apiBase port sign",[](json& j, HostEnv&) { j["apiBase"] = "http://127.0.0.1:+2355"; }, "bad_api_base"},
         {"apiBase a number", [](json& j, HostEnv&) { j["apiBase"] = 23551; }, "bad_api_base"},
         {"apiBase port 1", [](json& j, HostEnv&) { j["apiBase"] = "http://127.0.0.1:1"; }, ""},
         {"apiBase port 65535", [](json& j, HostEnv&) { j["apiBase"] = "http://127.0.0.1:65535"; }, ""},
@@ -110,8 +129,14 @@ void RunRows() {
         {"permissions missing", [](json& j, HostEnv&) { j.erase("permissions"); }, "bad_permissions"},
         {"permissions null", [](json& j, HostEnv&) { j["permissions"] = nullptr; }, "bad_permissions"},
         {"permissions empty", [](json& j, HostEnv&) { j["permissions"] = json::array(); }, ""},
-        // lang: optional, but a string when present.
+        // lang: optional; when present 1..16 of [A-Za-z0-9_-].
         {"lang a number", [](json& j, HostEnv&) { j["lang"] = 1; }, "bad_lang"},
+        {"lang 17 chars", [](json& j, HostEnv&) { j["lang"] = std::string(17, 'z'); }, "bad_lang"},
+        {"lang with a space", [](json& j, HostEnv&) { j["lang"] = "zh CN"; }, "bad_lang"},
+        {"lang with a quote", [](json& j, HostEnv&) { j["lang"] = "zh\""; }, "bad_lang"},
+        {"lang empty", [](json& j, HostEnv&) { j["lang"] = ""; }, "bad_lang"},
+        {"lang 16 chars", [](json& j, HostEnv&) { j["lang"] = std::string(16, 'z'); }, ""},
+        {"lang zh-CN", [](json& j, HostEnv&) { j["lang"] = "zh-CN"; }, ""},
         {"lang missing", [](json& j, HostEnv&) { j.erase("lang"); }, ""},
         // stopEvent: non-empty, equal to GHOST_PLUGIN_STOP_EVENT when that exists.
         {"stopEvent empty", [](json& j, HostEnv& e) { j["stopEvent"] = ""; e.stopEvent = ""; }, "bad_stop_event"},
@@ -119,7 +144,13 @@ void RunRows() {
         {"stopEvent a number", [](json& j, HostEnv&) { j["stopEvent"] = 3; }, "bad_stop_event"},
         {"stopEvent differs from env", [](json& j, HostEnv&) { j["stopEvent"] = "Local\\Other"; }, "bad_stop_event"},
         {"stopEvent empty, env absent", [](json& j, HostEnv& e) { j["stopEvent"] = ""; e.hasStopEvent = false; e.stopEvent.clear(); }, "bad_stop_event"},
-        {"env has no GHOST_PLUGIN_STOP_EVENT", [](json&, HostEnv& e) { e.hasStopEvent = false; e.stopEvent.clear(); }, ""},
+        // Control characters: the env carries the same value, so only the character is wrong.
+        {"stopEvent embedded NUL", [](json& j, HostEnv& e) { j["stopEvent"] = e.stopEvent = std::string("Local\\Stop\0x", 12); }, "bad_stop_event"},
+        {"stopEvent LF", [](json& j, HostEnv& e) { j["stopEvent"] = e.stopEvent = "Local\\Stop\nx"; }, "bad_stop_event"},
+        {"stopEvent 0x01", [](json& j, HostEnv& e) { j["stopEvent"] = e.stopEvent = "Local\\Stop\x01x"; }, "bad_stop_event"},
+        {"stopEvent 0x7F", [](json& j, HostEnv& e) { j["stopEvent"] = e.stopEvent = "Local\\Stop\x7fx"; }, "bad_stop_event"},
+        {"stopEvent NUL, env absent", [](json& j, HostEnv& e) { j["stopEvent"] = std::string("Local\\Stop\0x", 12); e.hasStopEvent = false; e.stopEvent.clear(); }, "bad_stop_event"},
+        {"env has no GHOST_PLUGIN_STOP_EVENT",[](json&, HostEnv& e) { e.hasStopEvent = false; e.stopEvent.clear(); }, ""},
         // Unknown fields are ignored; settings/license are not ours to judge.
         {"unknown field", [](json& j, HostEnv&) { j["future"] = json::array({1, 2}); }, ""},
         {"settings a string", [](json& j, HostEnv&) { j["settings"] = "x"; }, ""},
@@ -218,9 +249,9 @@ pf::LineResult ReadThroughPipe(const std::vector<std::string>& chunks, bool clos
     if (closeAfter) {
         writer.join();
         p.CloseWrite();
-        res = pf::ReadLine(p.r, pf::kMaxHandshakeLineBytes, line);
+        res = pf::ReadLine(p.r, pf::kMaxHostLineBytes, line);
     } else {
-        res = pf::ReadLine(p.r, pf::kMaxHandshakeLineBytes, line);
+        res = pf::ReadLine(p.r, pf::kMaxHostLineBytes, line);
         CloseHandle(p.r);
         p.r = nullptr;
         writer.join();
@@ -236,7 +267,7 @@ void ReadLineCases() {
     CHECK(ReadThroughPipe({}, true, &line) == pf::LineResult::Eof);
 
     // The 16 KB boundary, counted without the '\n'.
-    const std::string exact(pf::kMaxHandshakeLineBytes, 'a');
+    const std::string exact(pf::kMaxHostLineBytes, 'a');
     CHECK_MSG(ReadThroughPipe({exact + "\n"}, false, &line) == pf::LineResult::Ok && line.size() == exact.size(),
               "16384 bytes + LF is accepted");
     CHECK_MSG(ReadThroughPipe({exact + "a\n"}, false, &line) == pf::LineResult::TooLong, "16385 bytes + LF is too long");
@@ -259,7 +290,7 @@ void ReadHandshakeCases() {
     {
         // A good handshake padded past 16 KB by an unknown field is still rejected.
         json j = GoodHandshake();
-        j["pad"] = std::string(pf::kMaxHandshakeLineBytes, 'x');
+        j["pad"] = std::string(pf::kMaxHostLineBytes, 'x');
         PipePair p;
         const std::string l = pf::DumpSafe(j) + "\n";
         DWORD n = 0;
@@ -271,9 +302,9 @@ void ReadHandshakeCases() {
         json j = GoodHandshake();
         j["pad"] = "";
         const size_t base = pf::DumpSafe(j).size();
-        j["pad"] = std::string(pf::kMaxHandshakeLineBytes - base, 'x');
+        j["pad"] = std::string(pf::kMaxHostLineBytes - base, 'x');
         const std::string l = pf::DumpSafe(j);
-        CHECK(l.size() == pf::kMaxHandshakeLineBytes);
+        CHECK(l.size() == pf::kMaxHostLineBytes);
         PipePair p;
         const std::string withLf = l + "\n";
         DWORD n = 0;
@@ -303,8 +334,8 @@ void ReceiptCases() {
     std::string longErr = "x";
     for (int i = 0; i < 4000; ++i) longErr += "\xe7\xab\xaf";
     const std::string cut = pf::FormatReceiptError(longErr);
-    CHECK(cut.size() <= pf::kMaxReceiptLineBytes);
-    CHECK(cut.size() > pf::kMaxReceiptLineBytes - 8);
+    CHECK(cut.size() <= pf::kMaxHandshakeLineBytes);
+    CHECK(cut.size() > pf::kMaxHandshakeLineBytes - 8);
     CHECK(!cut.empty() && cut.back() == '\n');
     CHECK(std::count(cut.begin(), cut.end(), '\n') == 1);
     const json back = pf::ParseJsonNoThrow(cut.substr(0, cut.size() - 1));
@@ -315,7 +346,7 @@ void ReceiptCases() {
 
     // Characters that need escaping still produce a line that fits and parses.
     const std::string quoted = pf::FormatReceiptError(std::string(5000, '"'));
-    CHECK(quoted.size() <= pf::kMaxReceiptLineBytes);
+    CHECK(quoted.size() <= pf::kMaxHandshakeLineBytes);
     CHECK(pf::ParseJsonNoThrow(quoted.substr(0, quoted.size() - 1)).is_object());
     // A newline in the error text cannot become a second line.
     const std::string nl = pf::FormatReceiptError("a\nb");

@@ -65,6 +65,7 @@ public:
             WaitForSingleObject(pi_.hProcess, 5000);
         }
         if (stdinW_) CloseHandle(stdinW_);
+        if (stdinPeek_) CloseHandle(stdinPeek_);
         if (reader_.joinable()) reader_.join();  // ends once the child's stdout is closed
         if (stdoutR_) CloseHandle(stdoutR_);
         if (pi_.hThread) CloseHandle(pi_.hThread);
@@ -77,6 +78,12 @@ public:
         if (!CreatePipe(&inR, &stdinW_, &sa, 64 * 1024)) return false;
         if (!CreatePipe(&stdoutR_, &outW, &sa, 64 * 1024)) return false;
         SetHandleInformation(stdinW_, HANDLE_FLAG_INHERIT, 0);
+        // A non-inheritable copy of the child's stdin read end, only to look at what is
+        // still unread in the pipe (PeekNamedPipe); we never read through it.
+        if (!DuplicateHandle(GetCurrentProcess(), inR, GetCurrentProcess(), &stdinPeek_, 0, FALSE,
+                             DUPLICATE_SAME_ACCESS)) {
+            return false;
+        }
         SetHandleInformation(stdoutR_, HANDLE_FLAG_INHERIT, 0);
         HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0,
                                  nullptr);
@@ -129,6 +136,13 @@ public:
         return true;
     }
 
+    // Bytes written to the child's stdin that nobody has read yet.
+    DWORD StdinUnread() const {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(stdinPeek_, nullptr, 0, nullptr, &avail, nullptr)) return 0;
+        return avail;
+    }
+
     bool WriteStdin(const std::string& s) {
         DWORD n = 0;
         return WriteFile(stdinW_, s.data(), static_cast<DWORD>(s.size()), &n, nullptr) && n == s.size();
@@ -171,6 +185,7 @@ private:
 
     PROCESS_INFORMATION pi_ = {};
     HANDLE stdinW_ = nullptr;
+    HANDLE stdinPeek_ = nullptr;
     HANDLE stdoutR_ = nullptr;
     std::thread reader_;
     std::mutex mu_;
@@ -276,11 +291,20 @@ void HostedUnopenableStopEventBlocks() {
 void StandaloneDoesNotReadStdin() {
     Child c;
     CHECK(c.Start({}));
+    // A few bytes and no newline: a plugin that read stdin line-wise would block before
+    // the banner, and one that read whatever is there would empty the pipe.
+    const std::string probe = "probe-bytes";
+    CHECK(c.WriteStdin(probe));
     const std::string line = c.FirstLine(10000);
     CHECK_MSG(!line.empty(), "prints a line in standalone mode");
     CHECK(line.find("standalone") != std::string::npos);
     CHECK(line.find("\"ok\"") == std::string::npos);  // not a handshake receipt
     CHECK_MSG(c.Running(), "keeps running in standalone mode");
+    // After the banner, the bytes stay unread. Bounded: give a reader one second to show
+    // itself, rather than checking once and hoping it had not been scheduled yet.
+    CHECK_MSG(c.StdinUnread() == probe.size(), "the probe bytes are in the pipe after the banner");
+    CHECK_MSG(!pf_test::WaitUntil([&] { return c.StdinUnread() < probe.size(); }, 1000),
+              "standalone never reads stdin, not even after the banner");
 }
 
 // The exe's VERSIONINFO comes from manifest.json, its only source.

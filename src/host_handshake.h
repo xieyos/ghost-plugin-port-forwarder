@@ -17,13 +17,17 @@
 
 namespace pf {
 
-// One line from the host is at most 16 KB (kMaxHostLineBytes), excluding the '\n'.
-constexpr size_t kMaxHandshakeLineBytes = 16 * 1024;
-// Our answer, including its '\n', is at most 4 KB (kMaxHandshakeLineBytes on the
-// host's side) and must be written within 10 s of starting.
-constexpr size_t kMaxReceiptLineBytes = 4 * 1024;
+// Names and values as in spec-limits.md:
+// kMaxHostLineBytes -- one line the host writes to our stdin is at most 16 KB,
+// excluding the '\n'.
+constexpr size_t kMaxHostLineBytes = 16 * 1024;
+// kMaxHandshakeLineBytes -- our answer (the first stdout line), '\n' included, is at
+// most 4 KB; it must be written within 10 s (kHandshakeTimeoutMs) of starting.
+constexpr size_t kMaxHandshakeLineBytes = 4 * 1024;
 // Tokens go into an HTTP header: 1..128 characters of [0-9A-Za-z{}-].
 constexpr size_t kMaxTokenChars = 128;
+// lang is a short tag ("zh", "en", "zh-CN"): at most 16 of [A-Za-z0-9_-].
+constexpr size_t kMaxLangChars = 16;
 
 struct Handshake {
     std::string pluginId;
@@ -33,7 +37,7 @@ struct Handshake {
     uint16_t apiPort = 0;  // the <port> of apiBase
     std::string token;
     std::vector<std::string> permissions;  // the granted ones
-    std::string lang;                      // "" when the host sent none
+    std::string lang;                      // "" when the host sent none; else 1..16 of [A-Za-z0-9_-]
     std::string stopEvent;                 // the name to open, used verbatim
 
     bool HasPermission(const std::string& name) const;
@@ -60,8 +64,18 @@ bool ParseApiBase(const std::string& s, uint16_t* port);
 // 1..128 characters of [0-9A-Za-z{}-].
 bool IsTokenShaped(const std::string& s);
 
-// Validates one handshake line (without its '\n'). Returns "" and fills `out` on
-// success, otherwise a short reason code:
+// True when `s` holds a control character (< 0x20, embedded NUL included) or 0x7F.
+// Names and paths from the host go to Win32 calls that stop at the first NUL: a name
+// with one would be judged in full and used truncated.
+bool HasControlChar(const std::string& s);
+
+// An absolute Windows path: "X:\..." with a drive letter, or "\\..." (UNC, \\?\).
+bool IsAbsoluteWindowsPath(const std::string& s);
+
+// Validates one handshake line (without its '\n'). pluginDir and dataDir must be
+// absolute Windows paths; they, and stopEvent, must hold no control character; lang,
+// when present, is 1..16 of [A-Za-z0-9_-]. Returns "" and fills `out` on success,
+// otherwise a short reason code:
 //   bad_json, bad_v, bad_plugin_id, bad_plugin_dir, bad_data_dir, bad_api_base,
 //   bad_token, bad_permissions, bad_lang, bad_stop_event
 std::string ParseHandshake(const std::string& line, const HostEnv& env, Handshake* out);
@@ -77,7 +91,7 @@ LineResult ReadLine(HANDLE h, size_t maxBytes, std::string* line);
 // ReadLine + ParseHandshake. Adds the reason codes line_too_long and no_line.
 std::string ReadHandshake(HANDLE in, const HostEnv& env, Handshake* out);
 
-// The receipt line, '\n' included, never longer than kMaxReceiptLineBytes:
+// The receipt line, '\n' included, never longer than kMaxHandshakeLineBytes:
 //   ok:    {"v":1,"ok":true}  or  {"v":1,"ok":true,"uiUrl":"..."}
 //   error: {"v":1,"ok":false,"error":"..."}  (the text is cut to fit, on a UTF-8
 //          boundary)
