@@ -70,6 +70,10 @@
       "这个节点不支持 UDP：经它的 UDP 规则会失败（不会改走直连）。",
       "This node has no UDP relay: a UDP rule through it will fail (it never falls back to direct)."
     ],
+    eg_hint_udp_name: [
+      "部分节点的 UDP 中继不支持以域名作为目的地：如果一直收不到回包，请把远端主机改成 IP 地址。",
+      "Some nodes cannot relay UDP to a host name: if no replies ever arrive, use the remote host's IP address instead."
+    ],
     eg_hint_invalid: ["这个节点当前不可用：经它的连接会失败（不会改走直连）。",
       "This node is unusable right now: connections through it will fail (never direct instead)."],
     eg_hint_ghost: ["经 Ghost 节点的规则只在 Ghost 中运行时有效。", "Rules through Ghost nodes only run inside Ghost."],
@@ -579,8 +583,18 @@
         else if ($("fProto").value === "udp" && !n.udp) text = t("eg_hint_udp");
       });
     }
+    // spec-plugin-api.md section 10.4: some SOCKS5 relays do not take a host name (ATYP 3)
+    // as a UDP destination. Nothing fails visibly -- replies just never come.
+    if (text === "" && v !== "direct" && $("fProto").value === "udp" && isHostName($("fRemoteHost").value.trim())) {
+      text = t("eg_hint_udp_name");
+    }
     hint.textContent = text;
     hint.hidden = text === "";
+  }
+
+  // Neither an IPv4 nor an IPv6 literal (the server judges the full grammar).
+  function isHostName(h) {
+    return h !== "" && h.indexOf(":") < 0 && !/^[0-9.]+$/.test(h);
   }
 
   function updateProtoRows() {
@@ -718,9 +732,11 @@
     $("fProto").addEventListener("change", function () {
       updateProtoRows();
       fillEgress($("fEgress").value);
+      updateEgressHint();
     });
     $("fListenAddr").addEventListener("change", updateLanWarn);
     $("fEgress").addEventListener("change", updateEgressHint);
+    $("fRemoteHost").addEventListener("input", updateEgressHint);
     poll();
     setInterval(function () { if (state && !stopped) refreshNodes(false).then(render); }, 10000);
   }

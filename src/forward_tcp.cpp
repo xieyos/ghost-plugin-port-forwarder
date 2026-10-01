@@ -131,6 +131,7 @@ std::string ConnectDirect(TcpShared& s, UniqueSocket* out) {
     std::vector<ResolvedAddr> addrs;
     const std::string rc = ResolveHost(s.rule.remoteHost, s.rule.remotePort, SOCK_STREAM, s.stopEvent, &addrs);
     if (!rc.empty()) return rc;
+    InterleaveFamilies(&addrs);
 
     std::vector<UniqueSocket> pending;
     size_t next = 0;
@@ -247,16 +248,18 @@ bool PumpWrite(Direction& d) {
 }
 
 // One side of the connection failed. Best effort, within one slice: hand the healthy side
-// (d.dst) what is still buffered for it, then shutdown(SD_SEND), so it reads that data and
-// an EOF instead of losing the data to the close.
+// (d.dst) what is still buffered for it; then make its close abortive, so that it sees a
+// reset -- the stream did not end, it broke. (A direction already shut forwarded a real EOF
+// and has nothing buffered; the close is made abortive all the same.)
 void FlushToHealthy(TcpShared& s, Direction& d) {
-    if (d.shut) return;
-    size_t sent = 0;
-    const bool all = detail::FlushThenShutdown(d.dst, d.buf.get() + d.off, d.len - d.off, kPollSliceMs, &s.stop,
-                                               &sent);
-    *d.counter += sent;
-    d.off += sent;
-    if (all) d.shut = true;
+    if (!d.shut && d.off < d.len) {
+        size_t sent = 0;
+        detail::FlushBuffered(d.dst, d.buf.get() + d.off, d.len - d.off, kPollSliceMs, &s.stop, &sent);
+        *d.counter += sent;
+        d.off += sent;
+    }
+    linger abort = {1, 0};
+    setsockopt(d.dst, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&abort), sizeof(abort));
 }
 
 // Moves bytes both ways until both directions ended (graceful), an error, or a stop.
@@ -439,8 +442,8 @@ void AcceptLoop(std::shared_ptr<TcpShared> sp, SOCKET listenSock) {
 
 namespace detail {
 
-bool FlushThenShutdown(SOCKET dst, const char* data, size_t len, DWORD budgetMs, const std::atomic<bool>* stop,
-                       size_t* sent) {
+bool FlushBuffered(SOCKET dst, const char* data, size_t len, DWORD budgetMs, const std::atomic<bool>* stop,
+                   size_t* sent) {
     *sent = 0;
     const uint64_t deadline = GetTickCount64() + budgetMs;
     while (*sent < len) {
@@ -450,7 +453,8 @@ bool FlushThenShutdown(SOCKET dst, const char* data, size_t len, DWORD budgetMs,
         fd_set w;
         FD_ZERO(&w);
         FD_SET(dst, &w);
-        timeval tv = {0, static_cast<long>(deadline - now) * 1000};
+        const uint64_t left = deadline - now;
+        timeval tv = {static_cast<long>(left / 1000), static_cast<long>(left % 1000) * 1000};
         const int ready = select(0, nullptr, &w, nullptr, &tv);
         if (ready == SOCKET_ERROR) return false;
         if (ready == 0) continue;
@@ -462,8 +466,7 @@ bool FlushThenShutdown(SOCKET dst, const char* data, size_t len, DWORD budgetMs,
         if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
         return false;
     }
-    // Everything arrived: only now may the other side be told that nothing more is coming.
-    return shutdown(dst, SD_SEND) == 0;
+    return true;
 }
 
 }  // namespace detail

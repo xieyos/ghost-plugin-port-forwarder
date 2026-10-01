@@ -65,6 +65,21 @@ bool IsIPv4Literal(const std::string& s) {
     return InetPtonA(AF_INET, s.c_str(), &a) == 1;
 }
 
+// The connection being served by this thread (set by Serve before Handle).
+thread_local SOCKET t_client = INVALID_SOCKET;
+
+// The client closed its end (EOF or reset) -- not merely sent more bytes.
+bool ClientClosed(SOCKET c) {
+    if (c == INVALID_SOCKET) return false;
+    WSAPOLLFD p = {};
+    p.fd = c;
+    p.events = POLLRDNORM;
+    if (WSAPoll(&p, 1, 0) <= 0) return false;
+    char b;
+    const int n = recv(c, &b, 1, MSG_PEEK);
+    return n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK);
+}
+
 }  // namespace
 
 std::string FakeBase64Encode(const std::string& bytes) {
@@ -192,6 +207,31 @@ void FakeGhost::QueueTunnelErrors(std::vector<std::string> codes) {
     std::lock_guard<std::mutex> lock(mu_);
     for (auto& c : codes) tunnelErrorQueue_.push_back(std::move(c));
 }
+void FakeGhost::SetTunnelGate(HANDLE gate) {
+    std::lock_guard<std::mutex> lock(mu_);
+    tunnelGate_ = gate;
+}
+
+std::string FakeGhost::Describe() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    int list = 0;
+    int tunnel = 0;
+    int other = 0;
+    for (const auto& r : requests_) {
+        if (r.path == "/api/upstream/list") {
+            ++list;
+        } else if (r.path == "/api/upstream/tunnel") {
+            ++tunnel;
+        } else {
+            ++other;
+        }
+    }
+    return "fake ghost: list=" + std::to_string(list) + " tunnel=" + std::to_string(tunnel) +
+           " other=" + std::to_string(other) + " inProgress=" + std::to_string(tunnelsInProgress_.load()) +
+           " closedDuringDelay=" + std::to_string(closedDuringDelay_.load()) +
+           " udpEchoed=" + std::to_string(udpEchoed_.load());
+}
+
 void FakeGhost::SetTunnelDelayMs(DWORD ms) {
     std::lock_guard<std::mutex> lock(mu_);
     tunnelDelayMs_ = ms;
@@ -323,6 +363,7 @@ void FakeGhost::Serve(SOCKET c) {
                 requests_.push_back(req);
             }
 
+            t_client = c;
             const Answer a = Handle(req);
             if (a.drop) goto done;
             const bool close = Lower(req.Header("Connection")) == "close";
@@ -413,6 +454,7 @@ FakeGhost::Answer FakeGhost::HandleTunnel(const FakeRequest& req) {
 
     Answer a;
     DWORD delay = 0;
+    HANDLE gate = nullptr;
     bool drop = false;
     std::string fixedBody;
     std::string error;
@@ -423,6 +465,7 @@ FakeGhost::Answer FakeGhost::HandleTunnel(const FakeRequest& req) {
     {
         std::lock_guard<std::mutex> lock(mu_);
         delay = tunnelDelayMs_;
+        gate = tunnelGate_;
         drop = tunnelDrop_;
         fixedBody = tunnelFixedBody_;
         if (!tunnelErrorQueue_.empty()) {
@@ -436,9 +479,24 @@ FakeGhost::Answer FakeGhost::HandleTunnel(const FakeRequest& req) {
         hostMap = hostMap_;
         maxPayload = udpMaxPayload_;
     }
-    if (delay > 0 && WaitForSingleObject(stopEvent_, delay) != WAIT_TIMEOUT) {
-        a.drop = true;
-        return a;
+    if (delay > 0 || gate) {
+        // Wait out the delay and the gate in 50 ms steps, watching the client: a client that
+        // closes meanwhile has given up on the answer (an aborted request).
+        const ULONGLONG until = GetTickCount64() + delay;
+        for (;;) {
+            const bool delayDone = GetTickCount64() >= until;
+            const bool gateOpen = !gate || WaitForSingleObject(gate, 0) == WAIT_OBJECT_0;
+            if (delayDone && gateOpen) break;
+            if (WaitForSingleObject(stopEvent_, 50) != WAIT_TIMEOUT) {
+                a.drop = true;
+                return a;
+            }
+            if (ClientClosed(t_client)) {
+                ++closedDuringDelay_;
+                a.drop = true;
+                return a;
+            }
+        }
     }
     if (drop) {
         a.drop = true;

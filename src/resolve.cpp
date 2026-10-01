@@ -58,7 +58,7 @@ std::string ResolveHost(const std::string& host, int port, int socktype, HANDLE 
                                 nullptr, &lk->cancel);
         if (rc == WSA_IO_PENDING) {
             HANDLE waits[2] = {lk->ov.hEvent, stopEvent};
-            const DWORD w = WaitForMultipleObjects(stopEvent ? 2 : 1, waits, FALSE, INFINITE);
+            const DWORD w = WaitForMultipleObjects(stopEvent ? 2 : 1, waits, FALSE, kNameLookupTimeoutMs);
             if (w != WAIT_OBJECT_0) {
                 GetAddrInfoExCancel(&lk->cancel);
                 if (WaitForSingleObject(lk->ov.hEvent, kCancelWaitMs) != WAIT_OBJECT_0) {
@@ -66,7 +66,7 @@ std::string ResolveHost(const std::string& host, int port, int socktype, HANDLE 
                     // memory it may still write.
                     lk.release();
                 }
-                return resolve_err::kCancelled;
+                return w == WAIT_TIMEOUT ? std::string(fwd_err::kResolveFailed) : std::string(resolve_err::kCancelled);
             }
             rc = GetAddrInfoExOverlappedResult(&lk->ov);
         }
@@ -87,6 +87,27 @@ std::string ResolveHost(const std::string& host, int port, int socktype, HANDLE 
     Collect(list, out);
     FreeAddrInfoW(list);
     return out->empty() ? std::string(fwd_err::kResolveFailed) : std::string();
+}
+
+void InterleaveFamilies(std::vector<ResolvedAddr>* addrs) {
+    if (addrs->size() < 3) {
+        // Two addresses of different families are already interleaved; two of one family
+        // have nothing to interleave with.
+        return;
+    }
+    const int first = (*addrs)[0].family;
+    std::vector<ResolvedAddr> same;
+    std::vector<ResolvedAddr> other;
+    for (const ResolvedAddr& a : *addrs) (a.family == first ? same : other).push_back(a);
+    std::vector<ResolvedAddr> out;
+    out.reserve(addrs->size());
+    size_t i = 0;
+    size_t j = 0;
+    while (i < same.size() || j < other.size()) {
+        if (i < same.size()) out.push_back(same[i++]);
+        if (j < other.size()) out.push_back(other[j++]);
+    }
+    addrs->swap(out);
 }
 
 }  // namespace pf

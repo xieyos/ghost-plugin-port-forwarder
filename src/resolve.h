@@ -3,8 +3,9 @@
 // GetAddrInfoW blocks for as long as the resolver takes (seconds for a name no server
 // answers), and nothing can wake it: a connection thread inside it outlives its rule's stop
 // as a straggler. ResolveHost uses GetAddrInfoExW asynchronously instead and waits for
-// either the answer or `stopEvent`; on the stop it cancels the lookup (GetAddrInfoExCancel)
-// and returns `cancelled`. Where the asynchronous form is not available (it answers
+// either the answer, `stopEvent` or kNameLookupTimeoutMs; on the stop it cancels the lookup
+// (GetAddrInfoExCancel) and returns `cancelled`, on the timeout it cancels and returns
+// resolve_failed. Where the asynchronous form is not available (it answers
 // WSAEINVAL / WSAEOPNOTSUPP), it falls back to GetAddrInfoW -- the thread may then be a
 // straggler again, which forward_tcp.h / forward_udp.h already allow for.
 #pragma once
@@ -16,6 +17,8 @@
 #include <vector>
 
 namespace pf {
+
+constexpr DWORD kNameLookupTimeoutMs = 5000;
 
 namespace resolve_err {
 constexpr const char* kCancelled = "cancelled";
@@ -32,5 +35,10 @@ struct ResolvedAddr {
 // resolve_err::kCancelled. `stopEvent` may be null (not interruptible).
 std::string ResolveHost(const std::string& host, int port, int socktype, HANDLE stopEvent,
                         std::vector<ResolvedAddr>* out);
+
+// RFC 8305 section 4: alternates the address families, starting with the family of the first
+// address, keeping the order within each family. A dead first family then costs one attempt,
+// not all of its addresses.
+void InterleaveFamilies(std::vector<ResolvedAddr>* addrs);
 
 }  // namespace pf

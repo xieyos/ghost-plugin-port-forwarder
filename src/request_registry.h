@@ -11,6 +11,16 @@
 // handle, WinHTTP may hand the same value to the next request, which registers it again --
 // the first owner, comparing values only, would think the new request was still its own,
 // call WinHTTP on it, and finally Release (and close) someone else's request.
+//
+// What the generation does NOT close: Owned() and the WinHTTP call after it are two steps.
+// If Shutdown/Abort takes and closes the handle between them, and WinHTTP hands the same
+// value to a new request in that same instant, the owner's one call (send, receive, query,
+// read) acts on that new request. Release still refuses -- the owner never closes a handle
+// it does not own -- so the worst case is one stray call on a stranger's request, and it
+// needs an abort racing a reuse within a few instructions, which happens only while the
+// plugin is stopping or a rule's tunnel requests are being aborted. Closing it fully means
+// asynchronous WinHTTP (an abort then cancels the owner's own operation instead of closing
+// the handle under it); that is out of scope for v1.
 #pragma once
 
 #include <cstdint>

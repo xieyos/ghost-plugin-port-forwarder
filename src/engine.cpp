@@ -12,6 +12,9 @@ Engine::Engine(EngineOptions opts)
     ctx_.globalConnections = globalConnections_;
     ctx_.globalMax = opts.globalMaxConnections;
     ctx_.clock = opts.clock;
+    ctx_.udpRelays = std::make_shared<std::atomic<int>>(0);
+    ctx_.udpRelayMax = opts.maxUdpRelays;
+    applyStopBudgetMs_ = opts.applyStopBudgetMs != 0 ? opts.applyStopBudgetMs : opts.stopBudgetMs;
 }
 
 Engine::~Engine() { Stop(); }
@@ -86,7 +89,7 @@ void Engine::Apply(const std::vector<Rule>& rules) {
     for (Entry& o : old) {
         if (o.fwd) toStop.push_back(std::move(o.fwd));
     }
-    StopForwarders(std::move(toStop), GetTickCount64() + stopBudgetMs_, /*interruptible=*/true);
+    StopForwarders(std::move(toStop), GetTickCount64() + applyStopBudgetMs_, /*interruptible=*/true);
 
     // 2. Start what is new or changed -- unless Stop() was requested meanwhile: it is waiting
     // for this lock, and whatever runs now it must stop again.

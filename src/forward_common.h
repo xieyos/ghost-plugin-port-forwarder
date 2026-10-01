@@ -44,6 +44,9 @@ constexpr const char* kRemoteReset = "remote_reset";          // UDP: WSAECONNRE
 }  // namespace fwd_err
 
 constexpr int kGlobalMaxConnections = 1024;
+// Ghost keeps at most 32 UDP relays per plugin (spec-limits.md 7.2); asking for a 33rd only
+// earns a tunnel_limit answer, so the plugin counts its own and refuses locally.
+constexpr int kMaxUdpRelaysPerPlugin = 32;
 constexpr DWORD kPollSliceMs = 250;
 
 // A LogFn must keep alive whatever it calls. A straggler thread (forward_tcp.h) copies only
@@ -66,6 +69,10 @@ struct ForwardContext {
     LogFn log;                             // may be empty
     std::shared_ptr<std::atomic<int>> globalConnections;  // null = a private counter
     int globalMax = kGlobalMaxConnections;
+    // UDP relays (via-node sessions) open or being opened, across every rule of the engine.
+    // null = a private counter.
+    std::shared_ptr<std::atomic<int>> udpRelays;
+    int udpRelayMax = kMaxUdpRelaysPerPlugin;
     // What UDP rules measure session idleness and the failed-open cache with. Null =
     // DefaultClock(). Read only by a UDP rule's poll thread, which its forwarder joins, so
     // the clock need only outlive the engine.

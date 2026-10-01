@@ -16,7 +16,9 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace pf_test {
 
@@ -29,6 +31,25 @@ inline std::atomic<int>& Passes() {
     return n;
 }
 
+// What a failing check prints after its own line: the state of whatever the current test
+// drives (rule statuses and counters, the fake Ghost's request counts), so that a failure in
+// a log says what the world looked like, not only which line saw it. Scoped: a test sets one
+// with FailureContext after the objects it describes exist.
+inline std::vector<std::function<std::string()>>& FailureContexts() {
+    static std::vector<std::function<std::string()>> contexts;
+    return contexts;
+}
+
+class FailureContext {
+public:
+    explicit FailureContext(std::function<std::string()> describe) {
+        FailureContexts().push_back(std::move(describe));
+    }
+    ~FailureContext() { FailureContexts().pop_back(); }
+    FailureContext(const FailureContext&) = delete;
+    FailureContext& operator=(const FailureContext&) = delete;
+};
+
 inline void Report(bool ok, const char* expr, const char* label, const char* file, int line) {
     if (ok) {
         ++Passes();
@@ -36,6 +57,12 @@ inline void Report(bool ok, const char* expr, const char* label, const char* fil
     }
     ++Failures();
     std::fprintf(stderr, "FAIL %s:%d: %s%s%s\n", file, line, expr, label ? "  -- " : "", label ? label : "");
+    for (const auto& describe : FailureContexts()) {
+        try {
+            std::fprintf(stderr, "     state: %s\n", describe().c_str());
+        } catch (...) {
+        }
+    }
     std::fflush(stderr);
 }
 
@@ -166,7 +193,46 @@ inline bool ListenLoopback(LoopbackListener* out, int backlog = SOMAXCONN) {
     return true;
 }
 
+// ---- Comparisons that say what they saw ----------------------------------------------
+
+inline std::string ToText(const std::string& v) { return "\"" + v + "\""; }
+inline std::string ToText(const char* v) { return v ? ToText(std::string(v)) : std::string("null"); }
+inline std::string ToText(bool v) { return v ? "true" : "false"; }
+template <typename T>
+std::string ToText(const T& v) {
+    std::ostringstream o;
+    o << v;
+    return o.str();
+}
+
+template <typename A, typename B>
+void CheckEq(const A& a, const B& b, const char* ea, const char* eb, const char* file, int line) {
+    const bool ok = a == b;
+    if (ok) {
+        Report(true, "", nullptr, file, line);
+        return;
+    }
+    const std::string expr = std::string(ea) + " == " + eb;
+    const std::string label = ToText(a) + " vs " + ToText(b);
+    Report(false, expr.c_str(), label.c_str(), file, line);
+}
+
 }  // namespace pf_test
+
+// Both sides are printed when they differ.
+#define CHECK_EQ(a, b) ::pf_test::CheckEq((a), (b), #a, #b, __FILE__, __LINE__)
+// Waits up to `ms` for `pred`; on failure `describe` (a std::string expression, evaluated
+// only then, after the wait) says what the state was.
+#define CHECK_UNTIL(pred, ms, describe)                                                            \
+    do {                                                                                           \
+        const bool pf_ok_ = ::pf_test::WaitUntil([&] { return static_cast<bool>(pred); }, (ms)); \
+        if (pf_ok_) {                                                                              \
+            ::pf_test::Report(true, #pred, nullptr, __FILE__, __LINE__);                           \
+        } else {                                                                                   \
+            const std::string pf_d_ = (describe);                                                  \
+            ::pf_test::Report(false, #pred, pf_d_.c_str(), __FILE__, __LINE__);                    \
+        }                                                                                          \
+    } while (0)
 
 #define CHECK(cond) ::pf_test::Report(static_cast<bool>(cond), #cond, nullptr, __FILE__, __LINE__)
 #define CHECK_MSG(cond, label) ::pf_test::Report(static_cast<bool>(cond), #cond, (label), __FILE__, __LINE__)

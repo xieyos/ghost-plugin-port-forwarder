@@ -3,9 +3,9 @@
 //
 // The remote end of a connection:
 //   direct     remote.host is resolved here (asynchronously, so a stop cancels the lookup:
-//              resolve.h), and the addresses are tried the RFC 8305 way -- the next attempt
-//              starts 250 ms after the previous (at once when it failed), the first to
-//              connect wins, and 2 s cover the whole set.
+//              resolve.h), and the addresses are tried the RFC 8305 way -- families
+//              interleaved, the next attempt 250 ms after the previous (at once when it
+//              failed), the first to connect wins, and 2 s cover the whole set.
 //   via a node Ghost builds the connection through the user's upstream node and hands the
 //              socket over (TunnelSource::Open). ANY failure there closes the client's
 //              connection and records the code as lastError. There is no fallback to a
@@ -16,9 +16,12 @@
 // checked after every slice), one 64 KB buffer per direction. Half-close is forwarded: when
 // one side ends its sending (EOF) and everything it sent has been delivered, the other side
 // gets shutdown(SD_SEND); the connection is closed only when both directions have ended
-// that way, on a stop, or on an error. On an error of one side, what is buffered for the
-// other (healthy) side is first delivered, best effort within one slice, followed by
-// shutdown(SD_SEND) if all of it went (detail::FlushThenShutdown).
+// that way, on a stop, or on an error. shutdown(SD_SEND) is only ever the answer to a real
+// EOF. On an error of one side (a reset, a failed send), what is buffered for the other
+// (healthy) side is first handed to it, best effort within one slice (detail::FlushBuffered),
+// and the healthy side is then closed ABORTIVELY (SO_LINGER {1, 0}): it sees a reset, not an
+// EOF that would claim the stream was complete. Best effort means exactly that -- an abortive
+// close discards whatever the healthy side's kernel had not yet transmitted.
 //
 // Accept errors other than "nothing to take" / "reset before taken" (out of buffers, out of
 // handles) are recorded as internal_error and the accept thread then waits one slice: the
@@ -62,12 +65,11 @@ constexpr DWORD kStaggerDelayMs = 250;  // RFC 8305's "Connection Attempt Delay"
 constexpr size_t kPumpBufferBytes = 64 * 1024;
 
 namespace detail {
-// Sends data[0, len) to `dst` (non-blocking) within `budgetMs` or until `*stop`, then
-// shutdown(SD_SEND) -- but only if all of it went: an EOF after a gap would tell the reader
-// the stream was complete. `sent` receives the bytes sent. True when all went and the
-// shutdown succeeded.
-bool FlushThenShutdown(SOCKET dst, const char* data, size_t len, DWORD budgetMs, const std::atomic<bool>* stop,
-                       size_t* sent);
+// Sends data[0, len) to `dst` (non-blocking) within `budgetMs` or until `*stop`. `sent`
+// receives the bytes handed to the kernel. True when all of it was. Never shuts anything
+// down: the caller decides how the connection ends.
+bool FlushBuffered(SOCKET dst, const char* data, size_t len, DWORD budgetMs, const std::atomic<bool>* stop,
+                   size_t* sent);
 }  // namespace detail
 
 namespace testing {
@@ -81,7 +83,8 @@ struct TcpShared;  // forward_tcp.cpp
 class TcpForwarder final : public Forwarder {
 public:
     TcpForwarder(const Rule& rule, ForwardContext ctx);
-    // SignalStop + WaitStopped with a 3 s budget.
+    // SignalStop, then joins the accept thread. Connection threads are detached and own what
+    // they use; nothing waits for them here.
     ~TcpForwarder() override;
     TcpForwarder(const TcpForwarder&) = delete;
     TcpForwarder& operator=(const TcpForwarder&) = delete;

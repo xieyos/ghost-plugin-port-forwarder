@@ -56,6 +56,11 @@ struct EngineOptions {
     LogFn log;
     int globalMaxConnections = kGlobalMaxConnections;
     DWORD stopBudgetMs = kEngineStopBudgetMs;
+    // How long Apply() waits for the forwarders it stops. 0 = stopBudgetMs. (A test seam:
+    // set far above stopBudgetMs, Apply's wait can only end early because Stop() was called.)
+    DWORD applyStopBudgetMs = 0;
+    // UDP relays the plugin may hold at once (ForwardContext::udpRelayMax).
+    int maxUdpRelays = kMaxUdpRelaysPerPlugin;
     // UDP session idleness and the failed-open cache (forward_udp.h). Null = DefaultClock().
     // Must outlive the engine.
     Clock* clock = nullptr;
@@ -99,6 +104,7 @@ private:
 
     ForwardContext ctx_;
     DWORD stopBudgetMs_;
+    DWORD applyStopBudgetMs_;
     std::shared_ptr<std::atomic<int>> globalConnections_;
 
     std::atomic<bool> stopRequested_{false};  // set by Stop() before it takes mu_

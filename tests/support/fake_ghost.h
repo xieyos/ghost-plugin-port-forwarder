@@ -84,6 +84,9 @@ public:
     void SetTunnelError(std::string code); // "" = succeed; else every tunnel answers this code
     void QueueTunnelErrors(std::vector<std::string> codes);  // answered first, one per request
     void SetTunnelDelayMs(DWORD ms);       // wait before answering a tunnel request
+    // While set (non-null), a tunnel request is answered only once `gate` is signalled (the
+    // caller owns the event and keeps it alive while requests may wait on it).
+    void SetTunnelGate(HANDLE gate);
     void SetTunnelDrop(bool on);           // read the tunnel request, close without answering
     void SetTunnelFixedBody(std::string body);  // answer this, open nothing ("" = off)
     // Applied to the real success answer (after the socket was duplicated).
@@ -101,6 +104,11 @@ public:
     int TunnelsInProgress() const { return tunnelsInProgress_.load(); }
     // Datagrams echoed by the UDP relay ends.
     int UdpEchoed() const { return udpEchoed_.load(); }
+    // Tunnel requests whose client closed the connection while the answer was delayed or
+    // gated (what an aborted request looks like from here). Those are not answered.
+    int ClientClosedDuringDelay() const { return closedDuringDelay_.load(); }
+    // One line for a failure message: request counts by route, tunnels in progress, echoes.
+    std::string Describe() const;
     // Closes every UDP relay end this fake holds (the plugin's next recv then fails).
     void CloseUdpRelays();
 
@@ -142,6 +150,7 @@ private:
     std::string tunnelError_;
     std::deque<std::string> tunnelErrorQueue_;
     DWORD tunnelDelayMs_ = 0;
+    HANDLE tunnelGate_ = nullptr;
     bool tunnelDrop_ = false;
     std::string tunnelFixedBody_;
     std::function<void(pf::json&)> tunnelMutator_;
@@ -153,6 +162,7 @@ private:
 
     std::atomic<int> tunnelsInProgress_{0};
     std::atomic<int> udpEchoed_{0};
+    std::atomic<int> closedDuringDelay_{0};
 };
 
 // Standard base64 with padding (the fake's own encoder, independent of the plugin's
