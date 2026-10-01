@@ -1,6 +1,8 @@
 #include "rules.h"
 
+#include <array>
 #include <climits>
+#include <cstdint>
 
 namespace pf {
 
@@ -31,10 +33,37 @@ std::vector<std::string> Split(const std::string& s, char sep) {
     }
 }
 
-// One side of an IPv6 text around "::" (or the whole text without one). Counts groups;
-// a trailing dotted IPv4 counts as two and is allowed only when `mayEndInIPv4`.
-bool CountIPv6Groups(const std::string& side, bool mayEndInIPv4, int* groups) {
-    *groups = 0;
+int HexValue(char c) {
+    if (IsDigit(c)) return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return c - 'A' + 10;
+}
+
+// Strict dotted IPv4 -> host-order value.
+bool ParseStrictIPv4(const std::string& s, uint32_t* value) {
+    if (s.empty() || s.size() > 15) return false;
+    const std::vector<std::string> parts = Split(s, '.');
+    if (parts.size() != 4) return false;
+    uint32_t v = 0;
+    for (const std::string& p : parts) {
+        if (p.empty() || p.size() > 3) return false;
+        if (p.size() > 1 && p[0] == '0') return false;
+        uint32_t octet = 0;
+        for (char c : p) {
+            if (!IsDigit(c)) return false;
+            octet = octet * 10 + static_cast<uint32_t>(c - '0');
+        }
+        if (octet > 255) return false;
+        v = (v << 8) | octet;
+    }
+    if (value) *value = v;
+    return true;
+}
+
+// One side of an IPv6 text around "::" (or the whole text without one), as 16-bit groups;
+// a trailing dotted IPv4 becomes two groups and is allowed only when `mayEndInIPv4`.
+bool ParseIPv6Side(const std::string& side, bool mayEndInIPv4, std::vector<uint16_t>* groups) {
+    groups->clear();
     if (side.empty()) return true;
     const std::vector<std::string> pieces = Split(side, ':');
     for (size_t i = 0; i < pieces.size(); ++i) {
@@ -42,17 +71,56 @@ bool CountIPv6Groups(const std::string& side, bool mayEndInIPv4, int* groups) {
         if (p.empty()) return false;
         const bool last = i + 1 == pieces.size();
         if (p.find('.') != std::string::npos) {
-            if (!last || !mayEndInIPv4 || !IsStrictIPv4(p)) return false;
-            *groups += 2;
+            uint32_t v4 = 0;
+            if (!last || !mayEndInIPv4 || !ParseStrictIPv4(p, &v4)) return false;
+            groups->push_back(static_cast<uint16_t>(v4 >> 16));
+            groups->push_back(static_cast<uint16_t>(v4 & 0xFFFF));
             continue;
         }
         if (p.size() > 4) return false;
+        unsigned g = 0;
         for (char c : p) {
             if (!IsHexDigit(c)) return false;
+            g = (g << 4) | static_cast<unsigned>(HexValue(c));
         }
-        *groups += 1;
+        groups->push_back(static_cast<uint16_t>(g));
     }
     return true;
+}
+
+// IPv6 text (no brackets, no zone) -> eight groups.
+bool ParseIPv6(const std::string& s, std::array<uint16_t, 8>* out) {
+    if (s.size() < 2 || s.size() > 45) return false;
+    std::vector<uint16_t> left, right;
+    const size_t dbl = s.find("::");
+    if (dbl == std::string::npos) {
+        if (!ParseIPv6Side(s, true, &left) || left.size() != 8) return false;
+    } else {
+        // A second "::" (":::" included) is ambiguous.
+        if (s.find("::", dbl + 1) != std::string::npos) return false;
+        if (!ParseIPv6Side(s.substr(0, dbl), false, &left)) return false;
+        if (!ParseIPv6Side(s.substr(dbl + 2), true, &right)) return false;
+        if (left.size() + right.size() > 7) return false;
+    }
+    if (out) {
+        out->fill(0);
+        for (size_t i = 0; i < left.size(); ++i) (*out)[i] = left[i];
+        for (size_t i = 0; i < right.size(); ++i) (*out)[8 - right.size() + i] = right[i];
+    }
+    return true;
+}
+
+// ::ffff:0:0/96, in any spelling (::ffff:1.2.3.4, ::ffff:7f00:1, 0:0:0:0:0:ffff:...).
+bool IsV4MappedIPv6(const std::string& s) {
+    std::array<uint16_t, 8> g{};
+    if (!ParseIPv6(s, &g)) return false;
+    return g[0] == 0 && g[1] == 0 && g[2] == 0 && g[3] == 0 && g[4] == 0 && g[5] == 0xFFFF;
+}
+
+// Destinations no connection can be made to: the unspecified address, the limited
+// broadcast and IPv4 multicast (224.0.0.0/4).
+bool IsUnusableIPv4Destination(uint32_t v) {
+    return v == 0 || v == 0xFFFFFFFFu || (v >> 28) == 0xE;
 }
 
 bool PortInRange(int p) { return p >= 1 && p <= 65535; }
@@ -74,18 +142,24 @@ bool Contains(const std::vector<std::string>& v, const std::string& s) {
     return false;
 }
 
-// A direct rule whose remote end is its own listener: every accepted connection would
-// open another one to ourselves until the connection limit is hit.
+// A rule whose remote end is its own listener: every accepted connection would open
+// another one to ourselves until the connection limit is hit. This holds for every egress
+// kind: a Ghost node is often a local proxy client (e.g. Clash on 127.0.0.1), and the
+// plugin cannot see node addresses, so "127.0.0.1" through a node may well come back
+// here -- burning the tunnel budget on the way.
+//
+// v4-mapped IPv6 remotes never reach this point (bad_host), so the IPv4 text is the
+// only spelling of an IPv4 destination to compare.
 bool IsSelfLoop(const Rule& r, const std::vector<std::string>& localAddrs) {
-    if (r.egress != EgressKind::Direct) return false;
     if (r.remotePort != r.listenPort) return false;
     const std::string host = AsciiLower(r.remoteHost);
     if (host == r.listenAddr) return true;
-    const bool hostIsLoopback = host == "localhost" || (IsStrictIPv4(host) && host.compare(0, 4, "127.") == 0);
+    uint32_t v4 = 0;
+    const bool hostIsLoopback = host == "localhost" || (ParseStrictIPv4(host, &v4) && (v4 >> 24) == 127);
     if (r.listenAddr == kLoopbackAddr) return host == "localhost";
     if (r.listenAddr == kAnyAddr) {
         // 0.0.0.0 receives what is sent to any local address, loopback included.
-        return hostIsLoopback || host == kAnyAddr || Contains(localAddrs, host);
+        return hostIsLoopback || Contains(localAddrs, host);
     }
     return false;
 }
@@ -99,7 +173,7 @@ std::string ValidateRuleImpl(const Rule& r, const std::vector<std::string>* loca
     if (!IsStrictIPv4(r.listenAddr)) return rule_err::kBadListenAddr;
     if (localAddrs && r.listenAddr != kLoopbackAddr && r.listenAddr != kAnyAddr &&
         !Contains(*localAddrs, r.listenAddr)) {
-        return rule_err::kBadListenAddr;
+        return rule_err::kListenAddrNotLocal;
     }
     if (!PortInRange(r.listenPort)) return rule_err::kBadListenPort;
     // Anything but loopback is reachable from the network: every machine on the LAN can
@@ -157,35 +231,11 @@ bool operator==(const Rule& a, const Rule& b) {
 // ---- Grammar ------------------------------------------------------------------------------
 
 bool IsStrictIPv4(const std::string& s) {
-    if (s.empty() || s.size() > 15) return false;
-    const std::vector<std::string> parts = Split(s, '.');
-    if (parts.size() != 4) return false;
-    for (const std::string& p : parts) {
-        if (p.empty() || p.size() > 3) return false;
-        if (p.size() > 1 && p[0] == '0') return false;
-        int v = 0;
-        for (char c : p) {
-            if (!IsDigit(c)) return false;
-            v = v * 10 + (c - '0');
-        }
-        if (v > 255) return false;
-    }
-    return true;
+    return ParseStrictIPv4(s, nullptr);
 }
 
 bool IsIPv6Literal(const std::string& s) {
-    if (s.size() < 2 || s.size() > 45) return false;
-    const size_t dbl = s.find("::");
-    if (dbl == std::string::npos) {
-        int groups = 0;
-        return CountIPv6Groups(s, true, &groups) && groups == 8;
-    }
-    // A second "::" (":::" included) is ambiguous.
-    if (s.find("::", dbl + 1) != std::string::npos) return false;
-    int left = 0, right = 0;
-    if (!CountIPv6Groups(s.substr(0, dbl), false, &left)) return false;
-    if (!CountIPv6Groups(s.substr(dbl + 2), true, &right)) return false;
-    return left + right <= 7;
+    return ParseIPv6(s, nullptr);
 }
 
 bool IsHostName(const std::string& s) {
@@ -209,7 +259,10 @@ bool IsHostName(const std::string& s) {
 }
 
 bool IsValidRemoteHost(const std::string& s) {
-    return IsStrictIPv4(s) || IsIPv6Literal(s) || IsHostName(s);
+    uint32_t v4 = 0;
+    if (ParseStrictIPv4(s, &v4)) return !IsUnusableIPv4Destination(v4);
+    if (IsIPv6Literal(s)) return !IsV4MappedIPv6(s);
+    return IsHostName(s);
 }
 
 bool IsNodeIdShaped(const std::string& s) {
@@ -356,6 +409,11 @@ std::string ValidateRule(const Rule& r, const std::vector<std::string>& localAdd
 
 std::string ValidateStoredRule(const Rule& r) {
     return ValidateRuleImpl(r, nullptr);
+}
+
+std::string ValidateRuleChange(const Rule* before, const Rule& after, const std::vector<std::string>& localAddrs) {
+    if (before && before->listenAddr == after.listenAddr) return ValidateStoredRule(after);
+    return ValidateRule(after, localAddrs);
 }
 
 // ---- The set ------------------------------------------------------------------------------

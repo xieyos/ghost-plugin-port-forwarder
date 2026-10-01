@@ -35,6 +35,9 @@ pf_add_test(test_rules unit
 pf_add_test(test_rule_store functional
   SOURCES test_rule_store.cpp)
 
+pf_add_test(test_local_addrs_filter unit
+  SOURCES test_local_addrs_filter.cpp)
+
 pf_add_test(test_local_addrs functional
   SOURCES test_local_addrs.cpp)
 

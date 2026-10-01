@@ -94,11 +94,13 @@ void RuleRows() {
         {"listen.addr missing", [](json& j) { j["listen"].erase("addr"); }, E::kBadListenAddr},
         {"listen.addr a number", [](json& j) { j["listen"]["addr"] = 2130706433; }, E::kBadListenAddr},
         {"listen.addr localhost", [](json& j) { j["listen"]["addr"] = "localhost"; }, E::kBadListenAddr},
-        {"listen.addr 127.0.0.2", [](json& j) { j["listen"]["addr"] = "127.0.0.2"; }, E::kBadListenAddr},
+        {"listen.addr 127.0.0.2", [](json& j) { j["listen"]["addr"] = "127.0.0.2"; }, E::kListenAddrNotLocal},
         {"listen.addr 127.000.0.1", [](json& j) { j["listen"]["addr"] = "127.000.0.1"; }, E::kBadListenAddr},
         {"listen.addr ::1", [](json& j) { j["listen"]["addr"] = "::1"; }, E::kBadListenAddr},
         {"listen.addr not on this machine",
-         [](json& j) { j["listen"]["addr"] = "192.168.1.99"; j["lanAck"] = true; }, E::kBadListenAddr},
+         [](json& j) { j["listen"]["addr"] = "192.168.1.99"; j["lanAck"] = true; }, E::kListenAddrNotLocal},
+        {"listen.addr not on this machine, no lanAck either (membership first)",
+         [](json& j) { j["listen"]["addr"] = "192.168.1.99"; }, E::kListenAddrNotLocal},
         {"listen.addr local + lanAck", [](json& j) { j["listen"]["addr"] = "192.168.1.10"; j["lanAck"] = true; }, ""},
         {"listen.addr 0.0.0.0 + lanAck", [](json& j) { j["listen"]["addr"] = "0.0.0.0"; j["lanAck"] = true; }, ""},
         // lanAck
@@ -184,14 +186,46 @@ void RuleRows() {
         {"no loop: another port", [](json& j) { j["remote"] = {{"host", "127.0.0.1"}, {"port", 8081}}; }, ""},
         {"no loop: 127.0.0.2 is not our listener",
          [](json& j) { j["remote"] = {{"host", "127.0.0.2"}, {"port", 8080}}; }, ""},
-        {"no loop: through a node it is the node's own loopback",
+        // A Ghost node is often a local proxy client (e.g. Clash on 127.0.0.1): through it,
+        // 127.0.0.1 is our own loopback, so a node does not break the loop.
+        {"loop through a node",
          [](json& j) {
              j["remote"] = {{"host", "127.0.0.1"}, {"port", 8080}};
              j["egress"] = {{"kind", "node"}, {"nodeId", "n1"}};
          },
+         E::kLoop},
+        {"loop through the active node",
+         [](json& j) { j["remote"] = {{"host", "127.0.0.1"}, {"port", 8080}}; j["egress"]["kind"] = "active"; },
+         E::kLoop},
+        {"no loop through a node: another port",
+         [](json& j) {
+             j["remote"] = {{"host", "127.0.0.1"}, {"port", 8081}};
+             j["egress"] = {{"kind", "node"}, {"nodeId", "n1"}};
+         },
          ""},
-        {"no loop: through the active node",
-         [](json& j) { j["remote"] = {{"host", "127.0.0.1"}, {"port", 8080}}; j["egress"]["kind"] = "active"; }, ""},
+        {"no loop: 0.0.0.0:8080 -> 127.example.com:8080 (a name, not an address)",
+         [](json& j) {
+             j["listen"]["addr"] = "0.0.0.0";
+             j["lanAck"] = true;
+             j["remote"] = {{"host", "127.example.com"}, {"port", 8080}};
+         },
+         ""},
+        {"no loop: 0.0.0.0:8080 -> another machine:8080",
+         [](json& j) {
+             j["listen"]["addr"] = "0.0.0.0";
+             j["lanAck"] = true;
+             j["remote"] = {{"host", "192.168.1.20"}, {"port", 8080}};
+         },
+         ""},
+        // v4-mapped spellings of loopback cannot sneak past the loop check: they are bad_host.
+        {"::ffff:127.0.0.1 as remote", [](json& j) { j["remote"] = {{"host", "::ffff:127.0.0.1"}, {"port", 8080}}; },
+         E::kBadHost},
+        {"::ffff:7f00:1 as remote", [](json& j) { j["remote"] = {{"host", "::ffff:7f00:1"}, {"port", 8080}}; },
+         E::kBadHost},
+        // Destinations no connection can go to.
+        {"remote 0.0.0.0", [](json& j) { j["remote"]["host"] = "0.0.0.0"; }, E::kBadHost},
+        {"remote 255.255.255.255", [](json& j) { j["remote"]["host"] = "255.255.255.255"; }, E::kBadHost},
+        {"remote multicast 224.0.0.1", [](json& j) { j["remote"]["host"] = "224.0.0.1"; }, E::kBadHost},
         {"loop 0.0.0.0:8080 -> 127.0.0.5:8080",
          [](json& j) {
              j["listen"]["addr"] = "0.0.0.0";
@@ -268,7 +302,7 @@ void HostGrammar() {
     const struct {
         const char* host;
         bool ok;
-        bool oracle;  // InetPtonW(AF_INET6) must agree (rows with a ':' only)
+        bool oracle;  // IsIPv6Literal must agree with InetPtonW(AF_INET6) (rows with a ':' only)
     } rows[] = {
         // host names
         {"example.com", true, false},
@@ -304,9 +338,14 @@ void HostGrammar() {
         {"example.com:80", false, false},
         // IPv4
         {"1.2.3.4", true, false},
-        {"0.0.0.0", true, false},
-        {"255.255.255.255", true, false},
         {"10.0.0.0", true, false},
+        {"223.255.255.255", true, false},
+        {"240.0.0.1", true, false},  // reserved, but not multicast
+        {"0.0.0.0", false, false},
+        {"255.255.255.255", false, false},
+        {"224.0.0.0", false, false},
+        {"224.0.0.1", false, false},
+        {"239.255.255.255", false, false},
         {"1.2.3.04", false, false},
         {"01.2.3.4", false, false},
         {"256.1.1.1", false, false},
@@ -322,7 +361,15 @@ void HostGrammar() {
         {"1:2:3:4:5:6:7::", true, true},
         {"::2:3:4:5:6:7:8", true, true},
         {"ABCD:ef01::", true, true},
-        {"::ffff:1.2.3.4", true, true},
+        {"::ffff:1.2.3.4", false, true},  // v4-mapped: write the IPv4 form
+        {"::FFFF:127.0.0.1", false, true},
+        {"::ffff:7f00:1", false, true},
+        {"0:0:0:0:0:ffff:7f00:1", false, true},
+        {"0000:0000:0000:0000:0000:ffff:0102:0304", false, true},
+        {"::1.2.3.4", true, true},         // IPv4-compatible, not mapped
+        {"64:ff9b::1.2.3.4", true, true},  // NAT64
+        {"::fffe:1.2.3.4", true, true},
+        {"1::ffff:1.2.3.4", true, true},
         {"1:2:3:4:5:6:1.2.3.4", true, true},
         {"0000:0000:0000:0000:0000:0000:0000:0001", true, true},
         {":::", false, true},
@@ -349,8 +396,8 @@ void HostGrammar() {
             IN6_ADDR a = {};
             const std::wstring w(r.host, r.host + std::char_traits<char>::length(r.host));
             const bool inet = InetPtonW(AF_INET6, w.c_str(), &a) == 1;
-            const std::string olabel = label + " agrees with InetPtonW";
-            CHECK_MSG(inet == r.ok, olabel.c_str());
+            const std::string olabel = label + ": IsIPv6Literal agrees with InetPtonW";
+            CHECK_MSG(inet == pf::IsIPv6Literal(r.host), olabel.c_str());
         }
     }
     // Lengths: labels of 63 and names of 253 bytes are the limits.
@@ -468,13 +515,40 @@ void StoredVariant() {
     j["lanAck"] = true;
     Rule r;
     CHECK(pf::ParseRule(j, &r).empty());
-    CHECK_MSG(pf::ValidateRule(r, kLocal) == E::kBadListenAddr, "live check: must be on this machine");
+    CHECK_MSG(pf::ValidateRule(r, kLocal) == E::kListenAddrNotLocal, "live check: must be on this machine");
     CHECK_MSG(pf::ValidateStoredRule(r).empty(), "stored check: any strict IPv4");
     r.listenAddr = "10.255.255.01";
     CHECK_MSG(pf::ValidateStoredRule(r) == E::kBadListenAddr, "stored check: still a strict IPv4");
     r.listenAddr = "10.255.255.1";
     r.lanAck = false;
     CHECK_MSG(pf::ValidateStoredRule(r) == E::kLanAckRequired, "stored check: still needs lanAck");
+}
+
+// The UI server's check for an edit: membership only when listen.addr is new or changed.
+void RuleChange() {
+    json j = GoodRule();
+    j["listen"]["addr"] = "10.255.255.1";  // its adapter went away
+    j["lanAck"] = true;
+    Rule stored;
+    CHECK(pf::ParseRule(j, &stored).empty());
+
+    Rule disabled = stored;
+    disabled.enabled = false;
+    CHECK_MSG(pf::ValidateRuleChange(&stored, disabled, kLocal).empty(), "disable a rule whose address went away");
+    Rule renamed = stored;
+    renamed.name = "renamed";
+    CHECK_MSG(pf::ValidateRuleChange(&stored, renamed, kLocal).empty(), "rename it");
+    Rule badEdit = stored;
+    badEdit.remoteHost = "127.1";
+    CHECK_MSG(pf::ValidateRuleChange(&stored, badEdit, kLocal) == E::kBadHost, "the other checks still apply");
+    Rule moved = stored;
+    moved.listenAddr = "192.168.1.99";
+    CHECK_MSG(pf::ValidateRuleChange(&stored, moved, kLocal) == E::kListenAddrNotLocal,
+              "a changed listen address must be local");
+    moved.listenAddr = "10.0.0.5";
+    CHECK_MSG(pf::ValidateRuleChange(&stored, moved, kLocal).empty(), "a changed listen address that is local");
+    CHECK_MSG(pf::ValidateRuleChange(nullptr, stored, kLocal) == E::kListenAddrNotLocal,
+              "a new rule must use a local address");
 }
 
 void RoundTripAndEquality() {
@@ -577,6 +651,7 @@ int main() {
     SetRows();
     ParsedDefaults();
     StoredVariant();
+    RuleChange();
     RoundTripAndEquality();
     Documents();
     return pf_test::TestExitCode();

@@ -30,16 +30,17 @@ constexpr const char* kBadId = "bad_id";                    // id is not r_<16 l
 constexpr const char* kBadName = "bad_name";                // name: 1..64 code points, valid UTF-8, no controls
 constexpr const char* kBadEnabled = "bad_enabled";          // enabled present but not a boolean
 constexpr const char* kBadProto = "bad_proto";              // proto missing or not "tcp"/"udp"
-constexpr const char* kBadListenAddr = "bad_listen_addr";   // listen.addr not allowed here
+constexpr const char* kBadListenAddr = "bad_listen_addr";   // listen.addr not a strict dotted IPv4
+constexpr const char* kListenAddrNotLocal = "listen_addr_not_local";  // not 127.0.0.1, 0.0.0.0 or ours
 constexpr const char* kBadListenPort = "bad_listen_port";   // listen.port not an integer 1..65535
-constexpr const char* kBadHost = "bad_host";                // remote.host fails the host grammar
+constexpr const char* kBadHost = "bad_host";                // remote.host fails IsValidRemoteHost
 constexpr const char* kBadRemotePort = "bad_remote_port";   // remote.port not an integer 1..65535
 constexpr const char* kBadEgress = "bad_egress";            // egress not an object / kind unknown
 constexpr const char* kBadNodeId = "bad_node_id";           // kind "node" without a well-formed nodeId
 constexpr const char* kBadLimits = "bad_limits";            // maxConnections 1..1024, udpIdleSec 5..3600
 constexpr const char* kBadLanAck = "bad_lan_ack";           // lanAck present but not a boolean
 constexpr const char* kLanAckRequired = "lan_ack_required"; // non-loopback listen without lanAck:true
-constexpr const char* kLoop = "loop";                       // a direct rule that forwards to itself
+constexpr const char* kLoop = "loop";                       // a rule that forwards to its own listener
 // The set
 constexpr const char* kTooManyRules = "too_many_rules";     // more than kMaxRules
 constexpr const char* kDuplicateId = "duplicate_id";
@@ -100,7 +101,11 @@ bool IsIPv6Literal(const std::string& s);
 // not start with "0x"/"0X" -- otherwise a resolver may read it as a number (127.1,
 // 0x7f000001) and connect somewhere the text does not say.
 bool IsHostName(const std::string& s);
-// remote.host: exactly one of the three above.
+// remote.host: one of the three above, minus destinations no connection can go to or
+// that hide another spelling:
+//   IPv4 0.0.0.0, 255.255.255.255 and multicast 224.0.0.0/4 are rejected;
+//   v4-mapped IPv6 (::ffff:0:0/96, any spelling) is rejected -- write the IPv4 form, so
+//   that the self-loop check has one spelling of an IPv4 destination to compare.
 bool IsValidRemoteHost(const std::string& s);
 // ^[A-Za-z0-9_.-]{1,64}$
 bool IsNodeIdShaped(const std::string& s);
@@ -126,11 +131,13 @@ std::string ParseRule(const json& j, Rule* out);
 json RuleToJson(const Rule& r);
 
 // Range and grammar checks, in field order. `localAddrs` is this machine's IPv4
-// addresses (see local_addrs.h); listen.addr must be 127.0.0.1, 0.0.0.0 or one of them.
-// Kept as a parameter so this stays pure. Returns "" or a code from rule_err.
+// addresses (see local_addrs.h); listen.addr must be 127.0.0.1, 0.0.0.0 or one of them
+// (listen_addr_not_local otherwise). Kept as a parameter so this stays pure. Returns ""
+// or a code from rule_err.
 //
-// The self-loop check applies to direct rules only: through a node, "127.0.0.1" is the
-// node's own loopback and the connection never comes back here.
+// The self-loop check applies to every egress kind: a Ghost node is often a local proxy
+// client (e.g. Clash on 127.0.0.1), whose loopback is ours, and the plugin cannot see
+// node addresses to tell the difference.
 std::string ValidateRule(const Rule& r, const std::vector<std::string>& localAddrs);
 
 // The same checks for a rule read back from rules.json, except that listen.addr only
@@ -138,6 +145,13 @@ std::string ValidateRule(const Rule& r, const std::vector<std::string>& localAdd
 // VPN that is down) must not make the whole file "corrupt" and get it renamed aside.
 // Such a rule simply fails to bind when the engine starts it.
 std::string ValidateStoredRule(const Rule& r);
+
+// For the UI server (Task 6): the check for a rule being created or changed. `before` is
+// the stored rule it replaces, nullptr for a new rule. Membership in `localAddrs` is
+// required only when listen.addr is new or changed; otherwise (enable, disable, rename,
+// a new remote on an unchanged listen address) ValidateStoredRule applies -- a rule whose
+// adapter address went away can still be disabled, edited or deleted.
+std::string ValidateRuleChange(const Rule* before, const Rule& after, const std::vector<std::string>& localAddrs);
 
 // ---- The set ------------------------------------------------------------------------------
 

@@ -9,8 +9,20 @@
 
 namespace pf {
 
-std::vector<std::string> EnumerateLocalIPv4(std::string* error) {
+std::vector<std::string> FilterLocalIPv4(const std::vector<AdapterIPv4>& entries) {
     std::vector<std::string> out;
+    for (const AdapterIPv4& e : entries) {
+        if (!e.adapterUp || !e.preferred) continue;
+        if ((e.addrHostOrder >> 24) == 127 || e.addrHostOrder == 0) continue;
+        const uint32_t a = e.addrHostOrder;
+        const std::string s = std::to_string(a >> 24) + "." + std::to_string((a >> 16) & 0xFF) + "." +
+                              std::to_string((a >> 8) & 0xFF) + "." + std::to_string(a & 0xFF);
+        if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+    }
+    return out;
+}
+
+std::vector<std::string> EnumerateLocalIPv4(std::string* error) {
     const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER |
                         GAA_FLAG_SKIP_FRIENDLY_NAME;
     ULONG size = 16 * 1024;
@@ -22,26 +34,24 @@ std::vector<std::string> EnumerateLocalIPv4(std::string* error) {
         rc = GetAdaptersAddresses(AF_INET, flags, nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()),
                                   &size);
     }
-    if (rc == ERROR_NO_DATA) return out;  // no IPv4 adapter at all
+    if (rc == ERROR_NO_DATA) return {};  // no IPv4 adapter at all
     if (rc != NO_ERROR) {
         if (error) *error = "GetAdaptersAddresses failed: " + std::to_string(rc);
-        return out;
+        return {};
     }
+    std::vector<AdapterIPv4> entries;
     for (auto* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()); a; a = a->Next) {
-        if (a->OperStatus != IfOperStatusUp) continue;
         for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
             if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
-            if (u->DadState != IpDadStatePreferred) continue;
             const auto* sin = reinterpret_cast<const sockaddr_in*>(u->Address.lpSockaddr);
-            const unsigned long host = ntohl(sin->sin_addr.s_addr);
-            if ((host >> 24) == 127) continue;
-            char text[INET_ADDRSTRLEN] = {};
-            if (!inet_ntop(AF_INET, &sin->sin_addr, text, sizeof(text))) continue;
-            const std::string s(text);
-            if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+            AdapterIPv4 e;
+            e.adapterUp = a->OperStatus == IfOperStatusUp;
+            e.preferred = u->DadState == IpDadStatePreferred;
+            e.addrHostOrder = ntohl(sin->sin_addr.s_addr);
+            entries.push_back(e);
         }
     }
-    return out;
+    return FilterLocalIPv4(entries);
 }
 
 }  // namespace pf
