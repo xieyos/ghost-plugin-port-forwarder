@@ -12,6 +12,7 @@
 #include "fake_ghost.h"
 #include "http_client.h"
 #include "json_util.h"
+#include "plugin_child.h"
 #include "test_support.h"
 #include "util_str.h"
 
@@ -29,245 +30,23 @@ using pf::json;
 
 namespace {
 
-const char* kId = "com.qtvz.xieyos.port-forwarder";
-
 std::wstring g_exe;
 std::wstring g_manifest;
-
-std::string UniqueName(const char* tag) {
-    static int counter = 0;
-    return std::string("Local\\pf_test_exe_") + tag + "_" + std::to_string(GetCurrentProcessId()) + "_" +
-           std::to_string(++counter) + "_" + std::to_string(GetTickCount64());
-}
-
-bool StartsWithNoCase(const std::wstring& s, const wchar_t* prefix) {
-    const size_t n = wcslen(prefix);
-    return s.size() >= n && _wcsnicmp(s.c_str(), prefix, n) == 0;
-}
-
-// Our environment minus every GHOST_PLUGIN_* variable, plus `extra`.
-std::wstring BuildEnvBlock(const std::vector<std::pair<std::wstring, std::wstring>>& extra) {
-    std::wstring block;
-    if (wchar_t* env = GetEnvironmentStringsW()) {
-        for (const wchar_t* p = env; *p; p += wcslen(p) + 1) {
-            std::wstring entry(p);
-            if (StartsWithNoCase(entry, L"GHOST_PLUGIN_")) continue;
-            block += entry;
-            block.push_back(L'\0');
-        }
-        FreeEnvironmentStringsW(env);
-    }
-    for (const auto& kv : extra) {
-        block += kv.first + L"=" + kv.second;
-        block.push_back(L'\0');
-    }
-    block.push_back(L'\0');
-    return block;
-}
-
-class Child {
-public:
-    ~Child() {
-        if (pi_.hProcess) {
-            if (WaitForSingleObject(pi_.hProcess, 0) == WAIT_TIMEOUT) TerminateProcess(pi_.hProcess, 99);
-            WaitForSingleObject(pi_.hProcess, 5000);
-        }
-        if (stdinW_) CloseHandle(stdinW_);
-        if (stdinPeek_) CloseHandle(stdinPeek_);
-        if (reader_.joinable()) reader_.join();  // ends once the child's stdout is closed
-        if (stdoutR_) CloseHandle(stdoutR_);
-        if (pi_.hThread) CloseHandle(pi_.hThread);
-        if (pi_.hProcess) CloseHandle(pi_.hProcess);
-    }
-
-    bool Start(const std::vector<std::pair<std::wstring, std::wstring>>& env,
-               const std::vector<std::wstring>& args = {}) {
-        SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
-        HANDLE inR = nullptr, outW = nullptr;
-        if (!CreatePipe(&inR, &stdinW_, &sa, 64 * 1024)) return false;
-        if (!CreatePipe(&stdoutR_, &outW, &sa, 64 * 1024)) return false;
-        SetHandleInformation(stdinW_, HANDLE_FLAG_INHERIT, 0);
-        // A non-inheritable copy of the child's stdin read end, only to look at what is
-        // still unread in the pipe (PeekNamedPipe); we never read through it.
-        if (!DuplicateHandle(GetCurrentProcess(), inR, GetCurrentProcess(), &stdinPeek_, 0, FALSE,
-                             DUPLICATE_SAME_ACCESS)) {
-            return false;
-        }
-        SetHandleInformation(stdoutR_, HANDLE_FLAG_INHERIT, 0);
-        HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0,
-                                 nullptr);
-        if (nul == INVALID_HANDLE_VALUE) return false;
-
-        HANDLE inherit[3] = {inR, outW, nul};
-        SIZE_T attrSize = 0;
-        InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
-        std::vector<unsigned char> attrBuf(attrSize);
-        auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuf.data());
-        bool ok = InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize) &&
-                  UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit),
-                                            nullptr, nullptr);
-        STARTUPINFOEXW si = {};
-        si.StartupInfo.cb = sizeof(si);
-        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        si.StartupInfo.hStdInput = inR;
-        si.StartupInfo.hStdOutput = outW;
-        si.StartupInfo.hStdError = nul;
-        si.lpAttributeList = attrs;
-
-        std::wstring envBlock = BuildEnvBlock(env);
-        std::wstring cmd = L"\"" + g_exe + L"\"";
-        for (const auto& a : args) cmd += L" \"" + a + L"\"";
-        if (ok) {
-            ok = CreateProcessW(g_exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
-                                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                                envBlock.data(), nullptr, &si.StartupInfo, &pi_) != FALSE;
-        }
-        DeleteProcThreadAttributeList(attrs);
-        CloseHandle(inR);
-        CloseHandle(outW);
-        CloseHandle(nul);
-        if (!ok) return false;
-        started_ = GetTickCount64();
-
-        HANDLE r = stdoutR_;
-        reader_ = std::thread([this, r] {
-            try {
-                char buf[4096];
-                DWORD n = 0;
-                while (ReadFile(r, buf, sizeof(buf), &n, nullptr) && n > 0) {
-                    std::lock_guard<std::mutex> lock(mu_);
-                    out_.append(buf, n);
-                }
-            } catch (...) {
-            }
-            std::lock_guard<std::mutex> lock(mu_);
-            eof_ = true;
-        });
-        return true;
-    }
-
-    // Bytes written to the child's stdin that nobody has read yet.
-    DWORD StdinUnread() const {
-        DWORD avail = 0;
-        if (!PeekNamedPipe(stdinPeek_, nullptr, 0, nullptr, &avail, nullptr)) return 0;
-        return avail;
-    }
-
-    bool WriteStdin(const std::string& s) {
-        DWORD n = 0;
-        return WriteFile(stdinW_, s.data(), static_cast<DWORD>(s.size()), &n, nullptr) && n == s.size();
-    }
-
-    // The first stdout line (with its '\n') once it arrives within `ms`; "" otherwise.
-    std::string FirstLine(DWORD ms) {
-        const std::vector<std::string> l = Lines(1, ms);
-        return l.empty() ? std::string() : l[0];
-    }
-
-    // The first `n` stdout lines (each with its '\n') once they all arrived within `ms`;
-    // fewer otherwise.
-    std::vector<std::string> Lines(size_t n, DWORD ms) {
-        std::vector<std::string> lines;
-        WaitUntil_([&] {
-            std::lock_guard<std::mutex> lock(mu_);
-            lines.clear();
-            size_t pos = 0;
-            while (lines.size() < n) {
-                const size_t nl = out_.find('\n', pos);
-                if (nl == std::string::npos) break;
-                lines.push_back(out_.substr(pos, nl + 1 - pos));
-                pos = nl + 1;
-            }
-            return lines.size() == n;
-        }, ms);
-        return lines;
-    }
-
-    std::string AllOutputAfterExit(DWORD ms) {
-        WaitUntil_([&] {
-            std::lock_guard<std::mutex> lock(mu_);
-            return eof_;
-        }, ms);
-        std::lock_guard<std::mutex> lock(mu_);
-        return out_;
-    }
-
-    ULONGLONG ElapsedMs() const { return GetTickCount64() - started_; }
-    bool Running() const { return WaitForSingleObject(pi_.hProcess, 0) == WAIT_TIMEOUT; }
-
-    // True if the process exits within `ms`; the exit code goes to `code`.
-    bool ExitsWithin(DWORD ms, DWORD* code) const {
-        if (WaitForSingleObject(pi_.hProcess, ms) != WAIT_OBJECT_0) return false;
-        GetExitCodeProcess(pi_.hProcess, code);
-        return true;
-    }
-
-    DWORD pid() const { return pi_.dwProcessId; }
-
-private:
-    static bool WaitUntil_(const std::function<bool()>& f, DWORD ms) { return pf_test::WaitUntil(f, ms); }
-
-    PROCESS_INFORMATION pi_ = {};
-    HANDLE stdinW_ = nullptr;
-    HANDLE stdinPeek_ = nullptr;
-    HANDLE stdoutR_ = nullptr;
-    std::thread reader_;
-    std::mutex mu_;
-    std::string out_;
-    bool eof_ = false;
-    ULONGLONG started_ = 0;
-};
 
 // Where the hosted child is pointed: a temporary data directory and a fake Ghost (set in
 // wmain). Never Ghost's real control port: a log line must not land in a running Ghost.
 std::string g_dataDir;
 std::string g_apiBase;
 
-json Handshake(const std::string& stopEvent) {
-    json j = json::object();
-    j["v"] = 1;
-    j["pluginId"] = kId;
-    j["pluginDir"] = "C:\\plugins\\com.qtvz.xieyos.port-forwarder\\1.0.0";
-    j["dataDir"] = g_dataDir;
-    j["apiBase"] = g_apiBase;
-    j["token"] = "{11111111-2222-3333-4444-555555555555}";
-    j["permissions"] = json::array({"upstream.connect", "log.write"});
-    j["settings"] = json::object();
-    j["lang"] = "en";
-    j["stopEvent"] = stopEvent;
-    return j;
-}
+json Handshake(const std::string& stopEvent) { return pf_test::HostedHandshake(stopEvent, g_dataDir, g_apiBase); }
 
 std::vector<std::pair<std::wstring, std::wstring>> HostedEnv(const std::string& stopEvent) {
-    return {
-        {L"GHOST_PLUGIN_ID", pf::Utf8ToWide(kId)},
-        {L"GHOST_PLUGIN_DIR", L"C:\\plugins\\com.qtvz.xieyos.port-forwarder\\1.0.0"},
-        {L"GHOST_PLUGIN_DATA_DIR", pf::Utf8ToWide(g_dataDir)},
-        {L"GHOST_PLUGIN_API_BASE", pf::Utf8ToWide(g_apiBase)},
-        {L"GHOST_PLUGIN_STOP_EVENT", pf::Utf8ToWide(stopEvent)},
-    };
+    return pf_test::HostedEnv(stopEvent, g_dataDir, g_apiBase);
 }
 
-// The receipt line -> its uiUrl, checked against the host's rules (spec-host-protocol.md
-// 3.2, spec-manifest.md 5, spec-limits.md): "" when anything is off.
-std::string UiUrlOfReceipt(const std::string& line) {
-    if (line.empty() || line.back() != '\n') return std::string();
-    const json r = pf::ParseJsonNoThrow(line.substr(0, line.size() - 1));
-    long long v = 0;
-    if (!pf::JsonGetInt64(r, "v", &v) || v != 1) return std::string();
-    bool ok = false;
-    if (!pf::JsonGetBool(r, "ok", &ok) || !ok) return std::string();
-    std::string url;
-    if (!pf::JsonGetString(r, "uiUrl", &url)) return std::string();
-    if (r.size() != 3) return std::string();  // v, ok, uiUrl and nothing else
-    static const std::regex shape(R"(^http://127\.0\.0\.1:(\d{1,5})/[0-9a-f]{32}/$)");
-    std::smatch m;
-    if (!std::regex_match(url, m, shape)) return std::string();
-    const int port = std::atoi(m[1].str().c_str());
-    if (port < 1 || port > 65535 || port == 80 || port == 23551) return std::string();
-    if (url.size() > 2048) return std::string();
-    return url;
-}
+using pf_test::Child;
+using pf_test::UiUrlOfReceipt;
+using pf_test::UniqueName;
 
 // Hosted, happy path: receipt within 10 s with the page's address, the page there (frameable
 // by Ghost only), then a clean exit within 3 s of the stop event.
@@ -276,7 +55,7 @@ void HostedHandshakeAndStop(pf_test::FakeGhost& ghost) {
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, pf::Utf8ToWide(name).c_str());
     CHECK(ev != nullptr);
 
-    Child c;
+    Child c(g_exe);
     CHECK(c.Start(HostedEnv(name)));
     CHECK(c.WriteStdin(pf::DumpSafe(Handshake(name)) + "\n"));
 
@@ -346,7 +125,7 @@ void HostedStalledLogStillExits(pf_test::FakeGhost& ghost) {
     const int abandonedBefore = ghost.LogIngestAbandoned();
     const std::string name = UniqueName("stall");
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, pf::Utf8ToWide(name).c_str());
-    Child c;
+    Child c(g_exe);
     CHECK(c.Start(HostedEnv(name)));
     CHECK(c.WriteStdin(pf::DumpSafe(Handshake(name)) + "\n"));
     CHECK_MSG(!UiUrlOfReceipt(c.FirstLine(10000)).empty(), "receipt");
@@ -382,7 +161,7 @@ void HostedStalledLogStillExits(pf_test::FakeGhost& ghost) {
 void HostedHandshakeDeclined() {
     const std::string name = UniqueName("declined");
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, pf::Utf8ToWide(name).c_str());
-    Child c;
+    Child c(g_exe);
     CHECK(c.Start(HostedEnv(name)));
     json hs = Handshake(name);
     hs["v"] = 2;
@@ -405,7 +184,7 @@ void HostedHandshakeDeclined() {
 // host as a crash and get it restarted.
 void HostedUnopenableStopEventBlocks() {
     const std::string name = UniqueName("missing");  // never created
-    Child c;
+    Child c(g_exe);
     CHECK(c.Start(HostedEnv(name)));
     CHECK(c.WriteStdin(pf::DumpSafe(Handshake(name)) + "\n"));
     const std::string line = c.FirstLine(10000);
@@ -416,20 +195,13 @@ void HostedUnopenableStopEventBlocks() {
 
 std::vector<std::wstring> StandaloneArgs(const std::wstring& dir) { return {L"--no-browser", L"--data-dir", dir}; }
 
-// "Management page: <url>\n" -> <url>
-std::string UrlOfLine(const std::string& line) {
-    const std::string head = "Management page: ";
-    if (line.compare(0, head.size(), head) != 0) return std::string();
-    std::string url = line.substr(head.size());
-    while (!url.empty() && (url.back() == '\n' || url.back() == '\r')) url.pop_back();
-    return url;
-}
+using pf_test::UrlOfLine;
 
 // Standalone (no GHOST_PLUGIN_ID): stdin is a pipe that is never written and never
 // closed. A plugin that read it would block forever and never print.
 void StandaloneDoesNotReadStdin() {
     pf_test::ScopedTempDir dir;
-    Child c;
+    Child c(g_exe);
     CHECK(c.Start({}, StandaloneArgs(dir.path())));
     // A few bytes and no newline: a plugin that read stdin line-wise would block before
     // the banner, and one that read whatever is there would empty the pipe.
@@ -451,7 +223,7 @@ void StandaloneDoesNotReadStdin() {
 // same data directory refuses; the page's Stop button ends the process.
 void StandalonePageAndQuit() {
     pf_test::ScopedTempDir dir;
-    Child c;
+    Child c(g_exe);
     CHECK(c.Start({}, StandaloneArgs(dir.path())));
     const std::vector<std::string> lines = c.Lines(2, 10000);
     CHECK_MSG(lines.size() == 2, "banner and address");
@@ -473,7 +245,7 @@ void StandalonePageAndQuit() {
 
     // One instance per data directory.
     {
-        Child second;
+        Child second(g_exe);
         CHECK(second.Start({}, StandaloneArgs(dir.path())));
         DWORD code = 0;
         CHECK_MSG(second.ExitsWithin(5000, &code), "a second instance on the same data directory exits");

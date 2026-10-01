@@ -1,0 +1,175 @@
+name: Release
+
+# Pushing a tag v<version> publishes that version: the three assets Ghost installs from
+# (docs/plugin-sdk/spec-release.md section 3 in liliBestCoder/ghost-plugin-sdk):
+#   ghost-plugin.json, ghost-plugin.json.sig, <id>-<version>.gpkg
+#
+# Two jobs, so that the signing key is never on the machine that compiles and tests:
+#   build    (Windows, read-only token): tag == v<manifest version> == the exe's FileVersion,
+#            build, test, upload the five package files as an artifact.
+#   release  (Linux, contents: write): the SDK's packer at a pinned commit, sign with the
+#            GHOST_DEV_KEY_PEM secret (written to $RUNNER_TEMP for one step, then removed),
+#            verify with the committed dev-public.b64, create the GitHub Release.
+#
+# Every action is pinned by commit sha; Python packages by hash (.github/requirements-release.txt).
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: The tag is v<manifest version>
+        id: tag
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw -Encoding utf8 manifest.json | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -cne "v$version") {
+            Write-Output "::error::tag '$env:GITHUB_REF_NAME' is not v$version (manifest.json) -- Ghost fetches releases/download/v<version>/"
+            exit 1
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: The exe's FileVersion is the manifest's
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          $info = (Get-Item build/Release/port-forwarder.exe).VersionInfo
+          if ($info.FileVersion -cne $env:VERSION) {
+            Write-Output "::error::port-forwarder.exe FileVersion is '$($info.FileVersion)', the manifest says $env:VERSION"
+            exit 1
+          }
+
+      - name: Assemble pkg/
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item manifest.json, icon.png, LICENSE, THIRD_PARTY_NOTICES.txt -Destination pkg
+          Copy-Item build/Release/port-forwarder.exe -Destination pkg
+          $names = (Get-ChildItem pkg | Sort-Object Name).Name -join ','
+          if ($names -cne 'icon.png,LICENSE,manifest.json,port-forwarder.exe,THIRD_PARTY_NOTICES.txt') {
+            Write-Output "::error::pkg/ holds $names"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pkg
+          path: pkg/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      # The public SDK and the commit whose tools/plugin packs and signs this release. A commit,
+      # never a branch: the tool that signs a release must not change behind the maintainer's back.
+      SDK_REPO: liliBestCoder/ghost-plugin-sdk
+      SDK_REF: bb6a5d27b772d21d9dae54b82479c3d3f2f02883
+      # The first Ghost with upstream.connect; gpkg.py refuses anything lower for this manifest.
+      MIN_APP_VERSION: 1.2.1
+    steps:
+      - name: SDK_REF is a commit sha
+        run: |
+          if ! [[ "$SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::SDK_REF must be a 40-hex commit sha, got '$SDK_REF'"
+            exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          repository: ${{ env.SDK_REPO }}
+          ref: ${{ env.SDK_REF }}
+          path: sdk
+          sparse-checkout: tools/plugin
+          persist-credentials: false
+
+      - name: The SDK checkout is SDK_REF
+        run: |
+          head="$(git -C sdk rev-parse HEAD)"
+          if [ "$head" != "$SDK_REF" ]; then
+            echo "::error::checked out $head, expected $SDK_REF"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: pkg
+          path: pkg
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install cryptography (hash-pinned wheels only)
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r .github/requirements-release.txt
+
+      - name: Pack
+        run: |
+          python sdk/tools/plugin/gpkg.py pack --src pkg --out dist --min-app-version "$MIN_APP_VERSION"
+
+      - name: Sign
+        env:
+          GHOST_DEV_KEY_PEM: ${{ secrets.GHOST_DEV_KEY_PEM }}
+        run: |
+          key="$RUNNER_TEMP/dev-private.pem"
+          trap 'rm -f "$key"' EXIT
+          if [ -z "$GHOST_DEV_KEY_PEM" ]; then
+            echo "::error::the repository secret GHOST_DEV_KEY_PEM is not set"
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$GHOST_DEV_KEY_PEM" > "$key"
+          python sdk/tools/plugin/gpkg.py sign --key "$key" --dist dist
+
+      - name: Verify with the committed public key
+        run: |
+          python sdk/tools/plugin/gpkg.py verify --dist dist --pubkey dev-public.b64
+
+      - name: The release descriptor is this tag's
+        run: |
+          jq -e --arg v "${GITHUB_REF_NAME#v}" --arg m "$MIN_APP_VERSION" \
+            '.version == $v and .minAppVersion == $m' dist/ghost-plugin.json
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Port Forwarder ${GITHUB_REF_NAME#v}" --notes "See CHANGELOG.md." \
+            dist/ghost-plugin.json dist/ghost-plugin.json.sig dist/*.gpkg

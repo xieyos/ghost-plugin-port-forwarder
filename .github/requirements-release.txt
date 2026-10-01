@@ -1,0 +1,26 @@
+# Python packages for the release job (.github/workflows/release.yml): `cryptography` for
+# gpkg.py sign/verify, and its dependencies. Installed with
+#   pip install --require-hashes --only-binary=:all: -r .github/requirements-release.txt
+# -- that job holds the developer signing key, so nothing is built from source and every file
+# must match a hash below.
+#
+# The hashes are PyPI's published sha256 digests (https://pypi.org/pypi/<name>/<version>/json)
+# of the wheels for CPython 3.12 / abi3 on manylinux x86_64 (the release job: ubuntu-latest,
+# Python 3.12) and win_amd64 (a maintainer running the same steps on Windows). Checked with
+#   pip download --require-hashes --only-binary=:all: --python-version 3.12 --implementation cp
+#                --platform manylinux_2_34_x86_64 ... -r .github/requirements-release.txt
+# To update: bump the three versions together and take the digests from the same JSON.
+cryptography==50.0.2 \
+    --hash=sha256:630ebfea3bf689d075f82316324ff7433dc447fe6bc1bfc76524b74b4a9567d2 \
+    --hash=sha256:4061c0079120205fb760c58acab6443e217307dcf05e3702cf970e0689972856 \
+    --hash=sha256:9dab55f57c74c3cad24c323bacbbd04be4705ba6eb0d92e920b1fc4837ed5079 \
+    --hash=sha256:7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c \
+    --hash=sha256:ee247f5c245c9a2fe7c8e2214e295918838e44e00a45a6718451e4004219e767 \
+    --hash=sha256:f21e8a22c8605750c7af886bab299a363721264061b4ac0a30efb73cfd58efc5 \
+    --hash=sha256:1981f1db4630889b9ef7803fadef12b056f428cb6b85c27ba57b774793b6093c \
+    --hash=sha256:4e81d95e5bafc2d6e34e4bed780e53e4d5b9a2f928573428aa4d35fbec1eb0de
+cffi==2.1.1 \
+    --hash=sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf \
+    --hash=sha256:f53e442b08449d42821fa4a4fba000095af9f62742a500f978a9f557ec44339a
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992

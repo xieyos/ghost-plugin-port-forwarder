@@ -88,3 +88,65 @@ pf_add_test(test_ui_server functional
 pf_add_test(test_ui_source unit
   SOURCES test_ui_source.cpp
   ARGS "${PROJECT_SOURCE_DIR}/ui" "${PROJECT_SOURCE_DIR}/src")
+
+# The real exe hosted by a fake Ghost and then standalone, driven through its page API: three
+# kinds of rule end to end, fail-closed, restart, and what log.write carries.
+pf_add_test(test_end_to_end integration
+  SOURCES test_end_to_end.cpp
+  ARGS "$<TARGET_FILE:port-forwarder>"
+  DEPENDS port-forwarder
+  LIBS pf_fake_ghost)
+
+# The shipped exe's load-time imports: static CRT, system DLLs only, nothing newer than 1607.
+pf_add_test(test_imports unit
+  SOURCES test_imports.cpp
+  ARGS "$<TARGET_FILE:port-forwarder>"
+  DEPENDS port-forwarder)
+
+# ---- Checks written in Python (standard library only) ----------------------------------
+# Python is optional on a developer machine: without it these two are reported Skipped (exit
+# 77), never passed. CI sets PF_REQUIRE_PACK_TEST=ON, which turns a missing Python or SDK
+# into a failure -- a check that can silently skip is no check in CI.
+option(PF_REQUIRE_PACK_TEST "Fail (rather than skip) when Python or the plugin SDK is missing" OFF)
+if(DEFINED ENV{GHOST_PLUGIN_SDK} AND NOT "$ENV{GHOST_PLUGIN_SDK}" STREQUAL "")
+  set(PF_SDK_DEFAULT "$ENV{GHOST_PLUGIN_SDK}")
+else()
+  set(PF_SDK_DEFAULT "${PROJECT_SOURCE_DIR}/../ghost-plugin-sdk")
+endif()
+set(PF_GHOST_SDK_DIR "${PF_SDK_DEFAULT}" CACHE PATH
+    "A checkout of liliBestCoder/ghost-plugin-sdk (tools/plugin/gpkg.py) for the packing check")
+
+find_package(Python3 COMPONENTS Interpreter)
+if(NOT Python3_Interpreter_FOUND AND PF_REQUIRE_PACK_TEST)
+  message(FATAL_ERROR "PF_REQUIRE_PACK_TEST is ON but no Python 3 interpreter was found")
+endif()
+
+function(pf_add_py_test name label)
+  if(NOT label MATCHES "^(unit|functional|integration)$")
+    message(FATAL_ERROR "pf_add_py_test(${name}): label must be unit, functional or integration, got '${label}'")
+  endif()
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME ${name} COMMAND Python3::Interpreter ${ARGN})
+  elseif(CMAKE_VERSION VERSION_GREATER_EQUAL 3.29)
+    add_test(NAME ${name} COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_SOURCE_DIR}/skip_no_python.cmake")
+  else()
+    message(STATUS "${name}: no Python 3 interpreter -- not registered")
+    return()
+  endif()
+  set_tests_properties(${name} PROPERTIES LABELS ${label} TIMEOUT 120 SKIP_RETURN_CODE 77)
+endfunction()
+
+# The release files through the SDK's packer (gpkg.py pack --min-app-version 1.2.1).
+set(PF_PACK_ARGS
+  "${CMAKE_CURRENT_SOURCE_DIR}/test_pack.py"
+  --sdk "${PF_GHOST_SDK_DIR}"
+  --exe "$<TARGET_FILE:port-forwarder>"
+  --src "${PROJECT_SOURCE_DIR}")
+if(PF_REQUIRE_PACK_TEST)
+  list(APPEND PF_PACK_ARGS --require)
+endif()
+pf_add_py_test(test_pack functional ${PF_PACK_ARGS})
+
+# The workflows parse as YAML (no plain scalar with ": "), actions are pinned, SDK refs agree.
+pf_add_py_test(test_workflows unit
+  "${CMAKE_CURRENT_SOURCE_DIR}/check_workflows.py" "${PROJECT_SOURCE_DIR}/.github/workflows")
