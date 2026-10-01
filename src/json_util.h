@@ -54,6 +54,20 @@ inline bool JsonGetInt64(const json& obj, const char* key, long long* out) {
     return false;
 }
 
+// True when `obj[key]` is a boolean (never 0/1, never "true").
+inline bool JsonGetBool(const json& obj, const char* key, bool* out) {
+    if (!obj.is_object()) return false;
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_boolean()) return false;
+    if (out) *out = it->get<bool>();
+    return true;
+}
+
+// True when `obj` is an object holding `key` (of any type, null included).
+inline bool JsonHas(const json& obj, const char* key) {
+    return obj.is_object() && obj.find(key) != obj.end();
+}
+
 // True when `obj[key]` is an array whose every element is a string.
 inline bool JsonGetStringArray(const json& obj, const char* key, std::vector<std::string>* out) {
     if (!obj.is_object()) return false;

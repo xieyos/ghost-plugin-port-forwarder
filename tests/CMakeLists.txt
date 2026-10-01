@@ -29,6 +29,15 @@ endfunction()
 pf_add_test(test_handshake unit
   SOURCES test_handshake.cpp)
 
+pf_add_test(test_rules unit
+  SOURCES test_rules.cpp)
+
+pf_add_test(test_rule_store functional
+  SOURCES test_rule_store.cpp)
+
+pf_add_test(test_local_addrs functional
+  SOURCES test_local_addrs.cpp)
+
 pf_add_test(test_main_exe integration
   SOURCES test_main_exe.cpp
   ARGS "$<TARGET_FILE:port-forwarder>" "${PROJECT_SOURCE_DIR}/manifest.json"
