@@ -130,6 +130,22 @@ public:
     }
 };
 
+// Waits until `s` is readable -- data, EOF, an error, or a pending connection on a
+// listener -- checking `stop` every 50 ms. Returns false once `stop` is set. Test servers
+// block here instead of in accept/recv: on Windows neither shutdown() nor closing the
+// socket from another thread reliably wakes a blocked accept/recv, and a server whose
+// threads cannot be joined hangs the test at its very end.
+inline bool WaitReadable(SOCKET s, const std::atomic<bool>& stop) {
+    for (;;) {
+        if (stop.load()) return false;
+        WSAPOLLFD p = {};
+        p.fd = s;
+        p.events = POLLRDNORM;
+        const int r = WSAPoll(&p, 1, 50);
+        if (r != 0) return true;  // ready, or an error the next call reports itself
+    }
+}
+
 // Binds 127.0.0.1:0 and listens. Returns false (and leaves `out` closed) on failure.
 inline bool ListenLoopback(LoopbackListener* out, int backlog = SOMAXCONN) {
     out->Close();

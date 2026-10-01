@@ -65,16 +65,19 @@ add_link_options(/guard:cf /CETCOMPAT)
 
 # ---- pf_core: everything except main.cpp (the tests link it) --------------------
 add_library(pf_core STATIC
+  src/applog.cpp
+  src/ghost_api.cpp
   src/host_handshake.cpp
   src/local_addrs.cpp
   src/rule_store.cpp
   src/rules.cpp
+  src/tunnel_client.cpp
 )
 target_include_directories(pf_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
   "${PF_GEN_DIR}")
-target_link_libraries(pf_core PUBLIC bcrypt iphlpapi ws2_32)
+target_link_libraries(pf_core PUBLIC bcrypt iphlpapi winhttp ws2_32)
 
 # ---- The plugin executable -------------------------------------------------------
 add_executable(port-forwarder
