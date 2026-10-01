@@ -49,7 +49,8 @@ pf_add_test(test_local_addrs functional
 pf_add_test(test_main_exe integration
   SOURCES test_main_exe.cpp
   ARGS "$<TARGET_FILE:port-forwarder>" "${PROJECT_SOURCE_DIR}/manifest.json"
-  DEPENDS port-forwarder)
+  DEPENDS port-forwarder
+  LIBS pf_fake_ghost)
 
 pf_add_test(test_api_policy unit
   SOURCES test_api_policy.cpp)
@@ -76,3 +77,14 @@ pf_add_test(test_forward_tcp functional
 pf_add_test(test_forward_udp functional
   SOURCES test_forward_udp.cpp
   LIBS pf_fake_ghost)
+
+# The page server and its API. The test exe carries the page's resources itself, so that
+# the real files are what it serves (ui_assets.cpp reads the running exe's resources).
+set_source_files_properties("${PF_GEN_DIR}/resources.rc" PROPERTIES OBJECT_DEPENDS "${PF_UI_FILES}")
+pf_add_test(test_ui_server functional
+  SOURCES test_ui_server.cpp "${PF_GEN_DIR}/resources.rc"
+  LIBS pf_fake_ghost)
+
+pf_add_test(test_ui_source unit
+  SOURCES test_ui_source.cpp
+  ARGS "${PROJECT_SOURCE_DIR}/ui" "${PROJECT_SOURCE_DIR}/src")

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Port Forwarder</title>
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <h1 data-i18n="title">Port Forwarder</h1>
+  <span id="mode" class="badge"></span>
+  <span class="spacer"></span>
+  <button id="addBtn" type="button" class="primary" data-i18n="add_rule">Add rule</button>
+  <button id="quitBtn" type="button" class="danger" hidden data-i18n="stop">Stop</button>
+</header>
+
+<div id="banners"></div>
+
+<section id="editor" class="card" hidden>
+  <h2 id="editorTitle"></h2>
+  <form id="ruleForm" novalidate autocomplete="off">
+    <div class="grid">
+      <label><span data-i18n="f_name">Name</span>
+        <input id="fName" type="text" maxlength="64" required></label>
+      <label><span data-i18n="f_proto">Protocol</span>
+        <select id="fProto">
+          <option value="tcp">TCP</option>
+          <option value="udp">UDP</option>
+        </select></label>
+      <label><span data-i18n="f_listen_addr">Listen address</span>
+        <select id="fListenAddr"></select></label>
+      <label><span data-i18n="f_listen_port">Listen port</span>
+        <input id="fListenPort" type="number" min="1" max="65535" required></label>
+      <label><span data-i18n="f_remote_host">Remote host</span>
+        <input id="fRemoteHost" type="text" maxlength="253" spellcheck="false" required></label>
+      <label><span data-i18n="f_remote_port">Remote port</span>
+        <input id="fRemotePort" type="number" min="1" max="65535" required></label>
+      <label class="wide"><span data-i18n="f_egress">Egress</span>
+        <select id="fEgress"></select></label>
+      <label id="fMaxConnRow"><span data-i18n="f_max_conn">Max connections</span>
+        <input id="fMaxConn" type="number" min="1" max="1024"></label>
+      <label id="fUdpIdleRow"><span data-i18n="f_udp_idle">UDP idle timeout (s)</span>
+        <input id="fUdpIdle" type="number" min="5" max="3600"></label>
+      <label class="check"><input id="fEnabled" type="checkbox"> <span data-i18n="f_enabled">Enabled</span></label>
+    </div>
+    <p id="egressHint" class="hint" hidden></p>
+    <div id="lanWarn" class="warn" hidden>
+      <p data-i18n="lan_warning"></p>
+      <label class="check"><input id="fLanAck" type="checkbox"> <span data-i18n="lan_ack">I understand</span></label>
+    </div>
+    <p id="formError" class="error" role="alert" hidden></p>
+    <div class="actions">
+      <button type="submit" class="primary" data-i18n="save">Save</button>
+      <button type="button" id="cancelBtn" data-i18n="cancel">Cancel</button>
+    </div>
+  </form>
+</section>
+
+<main class="card">
+  <table id="rules">
+    <thead>
+      <tr>
+        <th data-i18n="col_name">Name</th>
+        <th data-i18n="col_proto">Protocol</th>
+        <th data-i18n="col_route">Listen → Remote</th>
+        <th data-i18n="col_egress">Egress</th>
+        <th data-i18n="col_status">Status</th>
+        <th data-i18n="col_conns">Connections</th>
+        <th data-i18n="col_traffic">Traffic</th>
+        <th data-i18n="col_error">Last error</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="ruleRows"></tbody>
+  </table>
+  <p id="empty" class="muted" hidden data-i18n="no_rules">No rules yet.</p>
+</main>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

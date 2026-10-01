@@ -56,6 +56,14 @@ set(PF_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(src/build_info.h.in "${PF_GEN_DIR}/build_info.h" @ONLY)
 configure_file(src/version.rc.in "${PF_GEN_DIR}/version.rc" @ONLY)
 
+# The management page: three files compiled into the exe as RCDATA (ui_assets.cpp). The
+# resource script is generated so that it can name them by absolute path; OBJECT_DEPENDS
+# makes an edited page rebuild the resources.
+set(PF_UI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ui")
+set(PF_UI_FILES "${PF_UI_DIR}/index.html" "${PF_UI_DIR}/app.js" "${PF_UI_DIR}/app.css")
+configure_file(src/resources.rc.in "${PF_GEN_DIR}/resources.rc" @ONLY)
+set_source_files_properties("${PF_GEN_DIR}/resources.rc" PROPERTIES OBJECT_DEPENDS "${PF_UI_FILES}")
+
 # ---- Compiler and linker flags ---------------------------------------------------
 add_compile_options(
   "$<$<COMPILE_LANGUAGE:CXX>:/W4;/WX;/permissive-;/utf-8;/guard:cf;/EHsc;/Zc:__cplusplus>")
@@ -65,6 +73,7 @@ add_link_options(/guard:cf /CETCOMPAT)
 
 # ---- pf_core: everything except main.cpp (the tests link it) --------------------
 add_library(pf_core STATIC
+  src/app.cpp
   src/applog.cpp
   src/engine.cpp
   src/forward_tcp.cpp
@@ -72,21 +81,25 @@ add_library(pf_core STATIC
   src/ghost_api.cpp
   src/host_handshake.cpp
   src/local_addrs.cpp
+  src/paths.cpp
   src/resolve.cpp
   src/rule_store.cpp
   src/rules.cpp
   src/tunnel_client.cpp
+  src/ui_assets.cpp
+  src/ui_server.cpp
 )
 target_include_directories(pf_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
   "${PF_GEN_DIR}")
-target_link_libraries(pf_core PUBLIC bcrypt iphlpapi winhttp ws2_32)
+target_link_libraries(pf_core PUBLIC bcrypt iphlpapi ole32 shell32 winhttp ws2_32)
 
 # ---- The plugin executable -------------------------------------------------------
 add_executable(port-forwarder
   src/main.cpp
-  "${PF_GEN_DIR}/version.rc")
+  "${PF_GEN_DIR}/version.rc"
+  "${PF_GEN_DIR}/resources.rc")
 target_link_libraries(port-forwarder PRIVATE pf_core)
 set_target_properties(port-forwarder PROPERTIES OUTPUT_NAME "port-forwarder")
 

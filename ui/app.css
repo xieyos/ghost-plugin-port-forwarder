@@ -1,0 +1,169 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --fg: #1d2330;
+  --muted: #667085;
+  --card: #ffffff;
+  --line: #d9dde5;
+  --accent: #2f6fde;
+  --accent-fg: #ffffff;
+  --ok: #18794e;
+  --warn-bg: #fff4d6;
+  --warn-fg: #6b4a00;
+  --err: #c4291c;
+  --err-bg: #fde8e6;
+  --input: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --fg: #e4e7ec;
+    --muted: #98a2b3;
+    --card: #1d2128;
+    --line: #333944;
+    --accent: #5b93f0;
+    --accent-fg: #0b1220;
+    --ok: #4cc38a;
+    --warn-bg: #3a2f12;
+    --warn-fg: #f5d58a;
+    --err: #ff8a7f;
+    --err-bg: #3a1c1a;
+    --input: #14171c;
+  }
+}
+
+* { box-sizing: border-box; }
+
+/* Every element below that sets its own display must still hide. */
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  padding: 12px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.45 "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.bar h1 { font-size: 18px; margin: 0; }
+.spacer { flex: 1; }
+
+.badge {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+.card h2 { font-size: 15px; margin: 0 0 10px; }
+
+button {
+  font: inherit;
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--fg);
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+button.danger { color: var(--err); border-color: var(--err); }
+button.small { padding: 1px 8px; font-size: 12px; }
+
+input, select {
+  font: inherit;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--input);
+  color: var(--fg);
+  width: 100%;
+}
+input[type="checkbox"] { width: auto; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px;
+}
+.grid label { display: flex; flex-direction: column; gap: 3px; }
+.grid label > span { color: var(--muted); font-size: 12px; }
+.grid label.wide { grid-column: span 2; }
+label.check { flex-direction: row; align-items: center; gap: 6px; }
+label.check > span { color: var(--fg); font-size: 14px; }
+
+.actions { display: flex; gap: 8px; margin-top: 12px; }
+.hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+
+.warn {
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-top: 10px;
+}
+.warn p { margin: 0 0 6px; }
+
+.error {
+  background: var(--err-bg);
+  color: var(--err);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 10px 0 0;
+}
+
+#banners .banner {
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
+#banners .banner.error { background: var(--err-bg); color: var(--err); margin-top: 0; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.num { white-space: nowrap; }
+td.actions-cell { white-space: nowrap; text-align: right; }
+td.actions-cell button { margin-left: 4px; }
+body.stopped td.actions-cell { visibility: hidden; }
+
+.st-listening { color: var(--ok); }
+.st-problem { color: var(--err); }
+.st-idle { color: var(--muted); }
+.muted { color: var(--muted); }
+.sub { display: block; color: var(--muted); font-size: 12px; }
+
+.toast {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  max-width: 420px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+.toast.error { color: var(--err); border-color: var(--err); }

@@ -1,15 +1,23 @@
 // Integration: the real port-forwarder.exe, started the way the Ghost plugin host starts
 // it -- pipes for stdin/stdout, stderr on NUL, CREATE_NO_WINDOW, exactly these three
-// handles inherited, GHOST_PLUGIN_* in the environment.
+// handles inherited, GHOST_PLUGIN_* in the environment -- with a fake Ghost as apiBase and
+// a temporary data directory. Hosted: the receipt carries a valid uiUrl, the page is served
+// there and may be framed by Ghost only, the stop event ends the process within 3 s.
+// Standalone (--no-browser --data-dir): stdin is never read, the page's address is printed,
+// the page is served, its Stop button ends the process, and a second instance on the same
+// data directory refuses to start.
 //
 // argv[1] = path of port-forwarder.exe, argv[2] = path of manifest.json.
 
+#include "fake_ghost.h"
+#include "http_client.h"
 #include "json_util.h"
 #include "test_support.h"
 #include "util_str.h"
 
 #include <cstdio>
 #include <mutex>
+#include <regex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -72,7 +80,8 @@ public:
         if (pi_.hProcess) CloseHandle(pi_.hProcess);
     }
 
-    bool Start(const std::vector<std::pair<std::wstring, std::wstring>>& env) {
+    bool Start(const std::vector<std::pair<std::wstring, std::wstring>>& env,
+               const std::vector<std::wstring>& args = {}) {
         SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
         HANDLE inR = nullptr, outW = nullptr;
         if (!CreatePipe(&inR, &stdinW_, &sa, 64 * 1024)) return false;
@@ -107,6 +116,7 @@ public:
 
         std::wstring envBlock = BuildEnvBlock(env);
         std::wstring cmd = L"\"" + g_exe + L"\"";
+        for (const auto& a : args) cmd += L" \"" + a + L"\"";
         if (ok) {
             ok = CreateProcessW(g_exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
                                 EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
@@ -150,15 +160,27 @@ public:
 
     // The first stdout line (with its '\n') once it arrives within `ms`; "" otherwise.
     std::string FirstLine(DWORD ms) {
-        std::string line;
+        const std::vector<std::string> l = Lines(1, ms);
+        return l.empty() ? std::string() : l[0];
+    }
+
+    // The first `n` stdout lines (each with its '\n') once they all arrived within `ms`;
+    // fewer otherwise.
+    std::vector<std::string> Lines(size_t n, DWORD ms) {
+        std::vector<std::string> lines;
         WaitUntil_([&] {
             std::lock_guard<std::mutex> lock(mu_);
-            const size_t nl = out_.find('\n');
-            if (nl == std::string::npos) return false;
-            line = out_.substr(0, nl + 1);
-            return true;
+            lines.clear();
+            size_t pos = 0;
+            while (lines.size() < n) {
+                const size_t nl = out_.find('\n', pos);
+                if (nl == std::string::npos) break;
+                lines.push_back(out_.substr(pos, nl + 1 - pos));
+                pos = nl + 1;
+            }
+            return lines.size() == n;
         }, ms);
-        return line;
+        return lines;
     }
 
     std::string AllOutputAfterExit(DWORD ms) {
@@ -180,6 +202,8 @@ public:
         return true;
     }
 
+    DWORD pid() const { return pi_.dwProcessId; }
+
 private:
     static bool WaitUntil_(const std::function<bool()>& f, DWORD ms) { return pf_test::WaitUntil(f, ms); }
 
@@ -194,13 +218,18 @@ private:
     ULONGLONG started_ = 0;
 };
 
+// Where the hosted child is pointed: a temporary data directory and a fake Ghost (set in
+// wmain). Never Ghost's real control port: a log line must not land in a running Ghost.
+std::string g_dataDir;
+std::string g_apiBase;
+
 json Handshake(const std::string& stopEvent) {
     json j = json::object();
     j["v"] = 1;
     j["pluginId"] = kId;
     j["pluginDir"] = "C:\\plugins\\com.qtvz.xieyos.port-forwarder\\1.0.0";
-    j["dataDir"] = "C:\\plugins\\com.qtvz.xieyos.port-forwarder\\.data";
-    j["apiBase"] = "http://127.0.0.1:23551";
+    j["dataDir"] = g_dataDir;
+    j["apiBase"] = g_apiBase;
     j["token"] = "{11111111-2222-3333-4444-555555555555}";
     j["permissions"] = json::array({"upstream.connect", "log.write"});
     j["settings"] = json::object();
@@ -213,14 +242,36 @@ std::vector<std::pair<std::wstring, std::wstring>> HostedEnv(const std::string& 
     return {
         {L"GHOST_PLUGIN_ID", pf::Utf8ToWide(kId)},
         {L"GHOST_PLUGIN_DIR", L"C:\\plugins\\com.qtvz.xieyos.port-forwarder\\1.0.0"},
-        {L"GHOST_PLUGIN_DATA_DIR", L"C:\\plugins\\com.qtvz.xieyos.port-forwarder\\.data"},
-        {L"GHOST_PLUGIN_API_BASE", L"http://127.0.0.1:23551"},
+        {L"GHOST_PLUGIN_DATA_DIR", pf::Utf8ToWide(g_dataDir)},
+        {L"GHOST_PLUGIN_API_BASE", pf::Utf8ToWide(g_apiBase)},
         {L"GHOST_PLUGIN_STOP_EVENT", pf::Utf8ToWide(stopEvent)},
     };
 }
 
-// Hosted, happy path: receipt within 10 s, then a clean exit within 3 s of the stop event.
-void HostedHandshakeAndStop() {
+// The receipt line -> its uiUrl, checked against the host's rules (spec-host-protocol.md
+// 3.2, spec-manifest.md 5, spec-limits.md): "" when anything is off.
+std::string UiUrlOfReceipt(const std::string& line) {
+    if (line.empty() || line.back() != '\n') return std::string();
+    const json r = pf::ParseJsonNoThrow(line.substr(0, line.size() - 1));
+    long long v = 0;
+    if (!pf::JsonGetInt64(r, "v", &v) || v != 1) return std::string();
+    bool ok = false;
+    if (!pf::JsonGetBool(r, "ok", &ok) || !ok) return std::string();
+    std::string url;
+    if (!pf::JsonGetString(r, "uiUrl", &url)) return std::string();
+    if (r.size() != 3) return std::string();  // v, ok, uiUrl and nothing else
+    static const std::regex shape(R"(^http://127\.0\.0\.1:(\d{1,5})/[0-9a-f]{32}/$)");
+    std::smatch m;
+    if (!std::regex_match(url, m, shape)) return std::string();
+    const int port = std::atoi(m[1].str().c_str());
+    if (port < 1 || port > 65535 || port == 80 || port == 23551) return std::string();
+    if (url.size() > 2048) return std::string();
+    return url;
+}
+
+// Hosted, happy path: receipt within 10 s with the page's address, the page there (frameable
+// by Ghost only), then a clean exit within 3 s of the stop event.
+void HostedHandshakeAndStop(pf_test::FakeGhost& ghost) {
     const std::string name = UniqueName("stop");
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, pf::Utf8ToWide(name).c_str());
     CHECK(ev != nullptr);
@@ -233,11 +284,33 @@ void HostedHandshakeAndStop() {
     CHECK_MSG(!line.empty(), "a receipt line arrives within 10 s");
     CHECK(c.ElapsedMs() < 10000);
     CHECK(line.size() <= 4096);
-    CHECK_MSG(line == "{\"v\":1,\"ok\":true}\n", line.c_str());
-    const json r = pf::ParseJsonNoThrow(line.substr(0, line.empty() ? 0 : line.size() - 1));
-    long long v = 0;
-    CHECK(pf::JsonGetInt64(r, "v", &v) && v == 1);
-    CHECK(r.is_object() && r.contains("ok") && r["ok"].is_boolean() && r["ok"].get<bool>());
+    const std::string url = UiUrlOfReceipt(line);
+    CHECK_MSG(!url.empty(), line.c_str());
+
+    unsigned short port = 0;
+    std::string prefix;
+    if (pf_test::SplitUiUrl(url, &port, &prefix)) {
+        const pf_test::HttpReply page = pf_test::RawHttp(port, pf_test::BuildRequest("GET", "/" + prefix + "/", port));
+        CHECK_MSG(page.status == 200, page.raw.substr(0, 200).c_str());
+        CHECK(page.Header("Content-Security-Policy") ==
+              "default-src 'self'; img-src 'self' data:; frame-ancestors " + g_apiBase);
+        CHECK(page.body.find("app.js") != std::string::npos);
+        // The API answers once the rules are loaded; the language is the handshake's.
+        json state;
+        CHECK(pf_test::WaitUntil([&] {
+            const pf_test::HttpReply r = pf_test::RawHttp(port, pf_test::BuildRequest("GET", "/" + prefix + "/api/state", port));
+            state = pf::ParseJsonNoThrow(r.body);
+            return r.status == 200;
+        }, 5000));
+        CHECK(state.is_object() && state["hosted"] == true && state["lang"] == "en" && state["canQuit"] == false);
+        // The host owns our lifetime: the page cannot end us.
+        const pf_test::HttpReply quit = pf_test::RawHttp(
+            port, pf_test::BuildRequest("POST", "/" + prefix + "/api/quit", port, "{}",
+                                        "http://127.0.0.1:" + std::to_string(port), "application/json"));
+        CHECK(quit.status == 403);
+    } else {
+        CHECK_MSG(false, "uiUrl splits into port and prefix");
+    }
 
     // It waits for the stop event rather than exiting on its own.
     CHECK_MSG(c.Running(), "still running after the receipt");
@@ -248,6 +321,19 @@ void HostedHandshakeAndStop() {
     CHECK_MSG(code == 0, ("exit code " + std::to_string(code)).c_str());
     // Nothing but the receipt was ever written to stdout.
     CHECK(c.AllOutputAfterExit(3000) == line);
+
+    // The log went to Ghost (log.write is granted) -- the start line and, sent before the API
+    // was shut down, the stop line -- and never carried the page's secret prefix.
+    bool started = false, stopping = false, leaked = false;
+    for (const auto& r : ghost.Requests()) {
+        if (r.path != "/api/log-ingest") continue;
+        if (r.body.find("started (hosted)") != std::string::npos) started = true;
+        if (r.body.find("Port Forwarder stopping") != std::string::npos) stopping = true;
+        if (!prefix.empty() && r.body.find(prefix) != std::string::npos) leaked = true;
+    }
+    CHECK_MSG(started, "the start line reached log.write");
+    CHECK_MSG(stopping, "the last batch was sent before the API shut down");
+    CHECK(!leaked);
     CloseHandle(ev);
 }
 
@@ -267,6 +353,7 @@ void HostedHandshakeDeclined() {
     CHECK(r.is_object() && r.contains("ok") && r["ok"].is_boolean() && !r["ok"].get<bool>());
     std::string err;
     CHECK(pf::JsonGetString(r, "error", &err) && err.find("bad_v") != std::string::npos);
+    CHECK(!r.contains("uiUrl"));
     DWORD code = 0;
     CHECK_MSG(c.ExitsWithin(3000, &code), "a declined plugin exits");
     CHECK(code == 1);
@@ -281,16 +368,28 @@ void HostedUnopenableStopEventBlocks() {
     CHECK(c.Start(HostedEnv(name)));
     CHECK(c.WriteStdin(pf::DumpSafe(Handshake(name)) + "\n"));
     const std::string line = c.FirstLine(10000);
-    CHECK_MSG(line == "{\"v\":1,\"ok\":true}\n", line.c_str());
+    CHECK_MSG(!UiUrlOfReceipt(line).empty(), line.c_str());
     DWORD code = 0;
     CHECK_MSG(!c.ExitsWithin(1500, &code), "keeps running when the stop event cannot be opened");
+}
+
+std::vector<std::wstring> StandaloneArgs(const std::wstring& dir) { return {L"--no-browser", L"--data-dir", dir}; }
+
+// "Management page: <url>\n" -> <url>
+std::string UrlOfLine(const std::string& line) {
+    const std::string head = "Management page: ";
+    if (line.compare(0, head.size(), head) != 0) return std::string();
+    std::string url = line.substr(head.size());
+    while (!url.empty() && (url.back() == '\n' || url.back() == '\r')) url.pop_back();
+    return url;
 }
 
 // Standalone (no GHOST_PLUGIN_ID): stdin is a pipe that is never written and never
 // closed. A plugin that read it would block forever and never print.
 void StandaloneDoesNotReadStdin() {
+    pf_test::ScopedTempDir dir;
     Child c;
-    CHECK(c.Start({}));
+    CHECK(c.Start({}, StandaloneArgs(dir.path())));
     // A few bytes and no newline: a plugin that read stdin line-wise would block before
     // the banner, and one that read whatever is there would empty the pipe.
     const std::string probe = "probe-bytes";
@@ -305,6 +404,52 @@ void StandaloneDoesNotReadStdin() {
     CHECK_MSG(c.StdinUnread() == probe.size(), "the probe bytes are in the pipe after the banner");
     CHECK_MSG(!pf_test::WaitUntil([&] { return c.StdinUnread() < probe.size(); }, 1000),
               "standalone never reads stdin, not even after the banner");
+}
+
+// Standalone: the page at the printed address, framed by no one; a second instance on the
+// same data directory refuses; the page's Stop button ends the process.
+void StandalonePageAndQuit() {
+    pf_test::ScopedTempDir dir;
+    Child c;
+    CHECK(c.Start({}, StandaloneArgs(dir.path())));
+    const std::vector<std::string> lines = c.Lines(2, 10000);
+    CHECK_MSG(lines.size() == 2, "banner and address");
+    if (lines.size() != 2) return;
+    const std::string url = UrlOfLine(lines[1]);
+    CHECK_MSG(!url.empty(), lines[1].c_str());
+    unsigned short port = 0;
+    std::string prefix;
+    CHECK(pf_test::SplitUiUrl(url, &port, &prefix));
+    CHECK(prefix.size() == 32);
+
+    const pf_test::HttpReply page = pf_test::RawHttp(port, pf_test::BuildRequest("GET", "/" + prefix + "/", port));
+    CHECK(page.status == 200);
+    CHECK(page.Header("Content-Security-Policy") ==
+          "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'");
+    const json state = pf::ParseJsonNoThrow(
+        pf_test::RawHttp(port, pf_test::BuildRequest("GET", "/" + prefix + "/api/state", port)).body);
+    CHECK(state.is_object() && state["hosted"] == false && state["canQuit"] == true && state["ghost"] == "needs_ghost");
+
+    // One instance per data directory.
+    {
+        Child second;
+        CHECK(second.Start({}, StandaloneArgs(dir.path())));
+        DWORD code = 0;
+        CHECK_MSG(second.ExitsWithin(5000, &code), "a second instance on the same data directory exits");
+        CHECK(code == 1);
+        CHECK(second.AllOutputAfterExit(3000).find("already running") != std::string::npos);
+    }
+    CHECK(c.Running());
+
+    const pf_test::HttpReply quit = pf_test::RawHttp(
+        port, pf_test::BuildRequest("POST", "/" + prefix + "/api/quit", port, "{}",
+                                    "http://127.0.0.1:" + std::to_string(port), "application/json"));
+    CHECK(quit.status == 200);
+    DWORD code = 12345;
+    CHECK_MSG(c.ExitsWithin(3000, &code), "the Stop button ends a standalone instance within 3 s");
+    CHECK(code == 0);
+    // Its log is the local file.
+    CHECK(GetFileAttributesW((dir.path() + L"\\port-forwarder.log").c_str()) != INVALID_FILE_ATTRIBUTES);
 }
 
 // The exe's VERSIONINFO comes from manifest.json, its only source.
@@ -360,10 +505,21 @@ int wmain(int argc, wchar_t** argv) {
     g_exe = Backslashes(argv[1]);
     g_manifest = Backslashes(argv[2]);
 
-    HostedHandshakeAndStop();
+    pf_test::WinsockScope wsa;
+    CHECK(wsa.ok());
+    pf_test::FakeGhost ghost;
+    CHECK(ghost.Start());
+    pf_test::ScopedTempDir dataDir;
+    CHECK(dataDir.ok());
+    g_dataDir = pf::WideToUtf8(dataDir.path());
+    g_apiBase = ghost.apiBase();
+
+    HostedHandshakeAndStop(ghost);
     HostedHandshakeDeclined();
     HostedUnopenableStopEventBlocks();
     StandaloneDoesNotReadStdin();
+    StandalonePageAndQuit();
     VersionMatchesManifest();
+    ghost.Stop();
     return pf_test::TestExitCode();
 }
