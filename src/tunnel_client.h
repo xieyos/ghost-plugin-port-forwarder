@@ -31,6 +31,15 @@
 //     (SOCK_STREAM for tcp, SOCK_DGRAM for udp), else it is closed and the call fails.
 //     TCP sockets get TCP_NODELAY and keepalive (60 s idle, 10 s interval). The socket
 //     stays in blocking mode with no timeouts, as Ghost hands it over.
+//   * Between WSASocketW and that SetHandleInformation the handle IS inheritable, and so
+//     is every socket Ghost duplicated in whose answer we never read (Shutdown below). A
+//     CreateProcess with bInheritHandles=TRUE anywhere in this process, at any moment,
+//     could hand such a connection through the user's proxy to a child. This plugin never
+//     calls CreateProcess with bInheritHandles=TRUE; keep it that way (a child that needs
+//     handles gets them through PROC_THREAD_ATTRIBUTE_HANDLE_LIST, never by inheritance).
+//   * Winsock: this client holds a WSAStartup reference while it lives, but an adopted
+//     socket can outlive it. The application holds its own WSAStartup for the whole
+//     process lifetime, so the last WSACleanup never runs under a live socket.
 #pragma once
 
 #include "clock.h"
@@ -41,6 +50,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -88,10 +98,16 @@ struct NodeList {
 
 // Answer of upstream.list -> NodeList. Exposed for the tests. Entries that are not
 // objects, or lack any of the six keys with the right type, or whose id is not a node id,
-// are skipped (the list stays useful when one entry is odd); a body that is not an object
+// whose name is not IsNodeNameShaped, or whose type is not socks5/http, are skipped (the list stays useful when one entry is odd); a body that is not an object
 // with status "ok", a top-level "active" that is neither a string nor null, or "nodes"
 // that is not an array is bad_response.
 NodeList ParseNodeList(const json& body);
+
+// A node name as Ghost reports it, before it reaches the page or the log: 1..256 bytes,
+// no C0 control character and no DEL. (JSON parsing has already rejected invalid UTF-8.)
+bool IsNodeNameShaped(const std::string& s);
+// "socks5" or "http": the two types Ghost reports.
+bool IsNodeTypeShaped(const std::string& s);
 
 struct TunnelNode {
     std::string id;
@@ -129,7 +145,9 @@ public:
     TunnelClient(const TunnelClient&) = delete;
     TunnelClient& operator=(const TunnelClient&) = delete;
 
-    // GET /api/upstream/list, cached for listCacheMs (successful answers only).
+    // GET /api/upstream/list, cached for listCacheMs (successful answers only). One fetch at
+    // a time: a caller that finds a fetch in progress gets the cached list, however old, at
+    // once; with nothing cached it waits for that fetch and shares its answer.
     NodeList ListNodes(bool forceRefresh = false);
 
     // POST /api/upstream/tunnel. egress Active -> via "active"; Node -> via "node" with
@@ -138,9 +156,12 @@ public:
     TunnelResult OpenTunnel(EgressKind egress, const std::string& nodeId, Proto proto, const std::string& host,
                             int port);
 
-    // Ends this client's slot waits and retry waits with `cancelled`, now and from now on.
-    // The GhostApi's own waits (token bucket, 429 backoff) end with GhostApi::Shutdown,
-    // which the owner of the shared GhostApi calls.
+    // Ends this client's slot waits and retry waits with `cancelled`, now and from now on,
+    // and aborts this client's requests on the wire (GhostApi::Abort with this client's
+    // tag): an OpenTunnel stuck waiting for Ghost returns `cancelled` at once. Meant for the
+    // end of the process -- see GhostApi::Shutdown about a socket stranded that way. The
+    // GhostApi's own waits (token bucket, 429 backoff) end with GhostApi::Shutdown, which
+    // the owner of the shared GhostApi calls after the log's last batch.
     void Shutdown();
 
     // Tunnel requests in flight right now (holding a slot).
@@ -161,10 +182,16 @@ private:
     std::atomic<int> inFlight_{0};
     bool wsaOk_ = false;
 
+    uintptr_t Tag() const { return reinterpret_cast<uintptr_t>(this); }
+
     std::mutex listMu_;
+    std::condition_variable listCv_;
     bool haveList_ = false;
     uint64_t listAt_ = 0;
     NodeList list_;
+    bool fetching_ = false;
+    uint64_t fetchGen_ = 0;  // bumped when a fetch ends
+    NodeList lastFetch_;     // the answer of the fetch that ended last
 };
 
 // Adopts raw WSAPROTOCOL_INFOW bytes (exactly kProtocolInfoBytes of them, else nothing is

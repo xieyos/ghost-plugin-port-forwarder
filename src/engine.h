@@ -13,15 +13,14 @@
 //
 // Stop() is final and bounded by stopBudgetMs, 2 s: the host allows the whole process 3 s
 // to exit after its stop event, and the UI server and the log's last batch come after it.
-// Stop() ends the tunnel source's waits (TunnelSource::Shutdown), signals every forwarder,
-// joins the accept threads and waits for connection threads until the budget is spent. A
-// connection thread can be blocked where no flag reaches it -- in name resolution, or
-// waiting for Ghost's answer to a tunnel request, which may take Ghost up to 10 s and must
-// not be abandoned (the answer may carry a socket already duplicated into this process).
-// Such a thread is left running: it owns what it uses through shared_ptrs (see
-// forward_tcp.h) and closes its sockets when its call returns. Joining it instead would
-// make Stop() take as long as Ghost does. StragglerThreads() counts them; the process may
-// exit with them running.
+// Stop() ends the tunnel source's waits and aborts its requests on the wire
+// (TunnelSource::Shutdown -- a tunnel request Ghost is slow to answer returns at once),
+// signals every forwarder, joins the accept threads and waits for connection threads until
+// the budget is spent. A connection thread can still be blocked where nothing reaches it:
+// in name resolution, or in a 429 backoff inside the API client. Such a thread is left
+// running: it owns what it uses through shared_ptrs (see forward_tcp.h) and closes its
+// sockets when its call returns. Joining it instead would make Stop() as slow as the
+// resolver. StragglerThreads() counts them; the process may exit with them running.
 #pragma once
 
 #include "forward_tcp.h"

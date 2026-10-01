@@ -508,16 +508,44 @@ void TestStopIsBounded() {
     e.Stop();
     const ULONGLONG took = GetTickCount64() - t0;
     std::printf("Stop() took %llu ms\n", took);
-    CHECK_MSG(took < 3000, "Stop() returns within 3 s while a tunnel request is stuck");
+    // Not the 2 s budget: the tunnel request Ghost has not answered is aborted
+    // (TunnelSource::Shutdown), so its thread is done well before that.
+    CHECK_MSG(took < 1000, "Stop() returns within 1 s while a tunnel request is stuck");
+    CHECK_MSG(e.StragglerThreads() == 0, "no thread is left behind");
     CHECK_MSG(ClosedByPeer(live.get()), "Stop closes the open connection");
+    CHECK_MSG(ClosedByPeer(waiting.get()), "and the one whose tunnel never came");
     CHECK(Refused(pDirect));
     CHECK(e.Snapshot().empty());
-
-    // The stuck thread finishes on its own once the request ends, and closes its client.
-    rig.fg.Stop();
-    CHECK(pf_test::WaitUntil([&] { return e.StragglerThreads() == 0; }, 15000));
-    CHECK(ClosedByPeer(waiting.get()));
     CHECK(rig.echo.Connections() == 1);  // only the direct one
+}
+
+// A thread the engine cannot reach still does not hold Stop() past its budget, and it
+// finishes on its own later. Name resolution is the real case; here it is a 429 backoff
+// inside the API client, which nothing but GhostApi::Shutdown wakes.
+void TestStopLeavesStragglerBehind() {
+    GhostRig rig;
+    rig.fg.Set429Always(true);
+    EngineOptions o;
+    o.tunnel = rig.source;
+    o.stopBudgetMs = 500;
+    Engine e(o);
+    const int pNode = FreePort();
+    e.Apply({MakeRule("r_0000000000000052", pNode, "echo.test", 7, EgressKind::Node, "n1")});
+    UniqueSocket waiting = Connect(pNode);
+    CHECK(waiting.valid());
+    // After the fourth 429 the client backs off for at least 2 s (250 ms doubling), far
+    // past the 500 ms budget.
+    CHECK(pf_test::WaitUntil([&] { return rig.fg.CountPath(kTunnel) >= 4; }, 10000));
+
+    const ULONGLONG t0 = GetTickCount64();
+    e.Stop();
+    const ULONGLONG took = GetTickCount64() - t0;
+    CHECK_MSG(took < 1500, "Stop() keeps to its budget");
+    CHECK_MSG(e.StragglerThreads() == 1, "the thread in the backoff is left running");
+    rig.api->Shutdown();  // what the app does after the log's last batch
+    CHECK(pf_test::WaitUntil([&] { return e.StragglerThreads() == 0; }, 5000));
+    CHECK(ClosedByPeer(waiting.get()));
+    CHECK(rig.echo.Connections() == 0);
 }
 
 void TestApplyRestartsOnlyChanged() {
@@ -573,6 +601,7 @@ int main() {
     run("via-node statuses", TestNodeStatuses);
     run("bind failure", TestBindFailure);
     run("stop is bounded", TestStopIsBounded);
+    run("stop leaves a straggler behind", TestStopLeavesStragglerBehind);
     run("apply restarts only the changed rule", TestApplyRestartsOnlyChanged);
     return pf_test::TestExitCode();
 }

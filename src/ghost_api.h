@@ -38,6 +38,8 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace pf {
 
@@ -48,7 +50,7 @@ constexpr const char* kGhostUnreachable = "ghost_unreachable";  // transport fai
 constexpr const char* kBadResponse = "bad_response";            // not a JSON object, an odd status, an odd code
 constexpr const char* kRateLimited = "rate_limited";            // still 429 after the last retry
 constexpr const char* kPermissionDenied = "permission_denied";  // 403
-constexpr const char* kCancelled = "cancelled";                 // Shutdown() during a wait
+constexpr const char* kCancelled = "cancelled";                 // Shutdown()/Abort(): a wait or a request on the wire
 }  // namespace api_err
 
 // Our own bucket, a little below Ghost's 20/s burst 100 (spec-limits.md 7.1), so that
@@ -94,18 +96,34 @@ public:
     GhostApi(const GhostApi&) = delete;
     GhostApi& operator=(const GhostApi&) = delete;
 
-    // `path` begins with '/'. `receiveTimeoutMs` 0 = kDefaultReceiveTimeoutMs.
-    ApiResult Get(const std::string& path, DWORD receiveTimeoutMs = 0);
-    ApiResult Post(const std::string& path, const json& body, DWORD receiveTimeoutMs = 0);
+    // `path` begins with '/'. `receiveTimeoutMs` 0 = kDefaultReceiveTimeoutMs. `tag` (0 = none)
+    // names a group of requests that Abort(tag) can end without touching the others; a
+    // caller uses its own address.
+    ApiResult Get(const std::string& path, DWORD receiveTimeoutMs = 0, uintptr_t tag = 0);
+    ApiResult Post(const std::string& path, const json& body, DWORD receiveTimeoutMs = 0, uintptr_t tag = 0);
 
     // True after a 401 (or when constructed with an unusable apiBase/token).
     bool Unavailable() const { return unavailable_.load(); }
 
     // Wakes and fails every wait (token bucket, backoff) with `cancelled`, now and from
-    // now on. A request already on the wire is NOT abandoned: its answer may carry a socket
-    // that has been duplicated into this process, and only a received answer can be
-    // adopted and closed.
+    // now on, and aborts every request on the wire: its WinHTTP request handle is closed,
+    // which ends a blocking synchronous call at once; that call answers `cancelled`.
+    //
+    // Abandoning a tunnel request this way can strand a socket: Ghost may already have
+    // duplicated it into this process, and only the answer we no longer read would have
+    // told us its handle. That is acceptable only because Shutdown() is for the end of the
+    // process -- the stranded handle is closed when the process exits a moment later.
+    // Without the abort, exit would wait for Ghost's answer, bounded only by the receive
+    // timeout (30 s for a tunnel), far past the host's 3 s.
+    //
+    // The plugin's log shares this client: call AppLog::Stop() BEFORE Shutdown(), or the
+    // log's last batch is cancelled instead of sent.
     void Shutdown();
+    // Aborts the requests on the wire that carry `tag` (not 0) and refuses new ones with it
+    // (`cancelled`), as Shutdown() does for all. Waits inside the call (token bucket, 429
+    // backoff) are not woken; the request is refused when they end. TunnelClient::Shutdown
+    // uses it so that the engine can stop while the log still has a batch to send.
+    void Abort(uintptr_t tag);
     // The event Shutdown() signals, for callers that want their own waits to end with it.
     HANDLE CancelEvent() const { return cancel_; }
     Clock* clock() const { return clock_; }
@@ -114,13 +132,25 @@ public:
     uint64_t RequestsSent() const { return sent_.load(); }
 
 private:
-    ApiResult Call(const wchar_t* method, const std::string& path, const std::string* body, DWORD receiveTimeoutMs);
+    ApiResult Call(const wchar_t* method, const std::string& path, const std::string* body, DWORD receiveTimeoutMs,
+                   uintptr_t tag);
     bool WaitForBudget();
     double Random01();
 
-    // One request on the wire. Returns false on a transport failure.
+    // One request on the wire. Returns false on a transport failure; `aborted` says whether
+    // Shutdown()/Abort() closed the handle under it.
     bool SendOnce(const wchar_t* method, const std::string& path, const std::string* body, DWORD receiveTimeoutMs,
-                  int* status, std::string* response, bool* tooLarge);
+                  uintptr_t tag, int* status, std::string* response, bool* tooLarge, bool* aborted);
+    // The live-request registry. Every request handle is in live_ while its call runs. It is
+    // closed exactly once: by its owner if the owner removes it (Release returns true), or
+    // by Shutdown()/Abort(), which remove it first and then close it.
+    bool Register(HINTERNET req, uintptr_t tag);
+    bool Release(HINTERNET req);
+    // Whether `req` is still in live_ (nobody aborted it). Checked before every WinHTTP
+    // call after the first: once Shutdown()/Abort() closed the handle its value may be
+    // reused by a new request, and a call on it would act on someone else's request.
+    bool Owned(HINTERNET req);
+    bool Refused(uintptr_t tag);
 
     Clock* clock_;
     std::function<double()> random01_;
@@ -139,6 +169,11 @@ private:
 
     std::mutex rngMu_;
     uint64_t rngState_ = 0;
+
+    std::mutex liveMu_;
+    std::vector<std::pair<HINTERNET, uintptr_t>> live_;
+    std::vector<uintptr_t> abortedTags_;
+    bool closed_ = false;  // under liveMu_: Shutdown() has swept live_
 };
 
 }  // namespace pf

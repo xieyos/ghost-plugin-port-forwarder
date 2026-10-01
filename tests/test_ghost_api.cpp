@@ -228,6 +228,89 @@ void TestShutdown() {
     CHECK_MSG(GetTickCount64() - t0 < 1500, "Shutdown ends the backoff wait at once");
 }
 
+// A request already on the wire: Ghost takes 10 s to answer. Shutdown() closes the request
+// handle under the blocked call, which returns `cancelled` at once -- not after the answer,
+// and not after the 30 s receive timeout.
+void TestShutdownAbortsRequestOnTheWire() {
+    FakeGhost fg;
+    CHECK(fg.Start());
+    fg.SetTunnelDelayMs(10000);
+    FakeClock clock;
+    GhostApi api(Opts(fg, &clock));
+    ApiResult r;
+    std::thread t([&] { r = api.Post("/api/upstream/tunnel", json{{"via", "active"}}, 30000); });
+    CHECK(pf_test::WaitUntil([&] { return fg.TunnelsInProgress() == 1; }, 5000));
+    const ULONGLONG t0 = GetTickCount64();
+    api.Shutdown();
+    t.join();
+    const ULONGLONG took = GetTickCount64() - t0;
+    CHECK_MSG(r.code == A::kCancelled, r.code.c_str());
+    CHECK_MSG(took < 1000, "the blocked call returns within 1 s of Shutdown");
+    CHECK(fg.CountPath("/api/upstream/tunnel") == 1);
+    CHECK(api.Get("/api/upstream/list").code == A::kCancelled);
+    CHECK(fg.Requests().size() == 1);
+}
+
+// Abort(tag) ends only the requests with that tag, and refuses that tag from then on.
+void TestAbortByTag() {
+    FakeGhost fg;
+    CHECK(fg.Start());
+    fg.SetTunnelDelayMs(10000);
+    fg.SetListDelayMs(1500);
+    FakeClock clock;
+    GhostApi api(Opts(fg, &clock));
+    const uintptr_t kTag = 0x5157;
+    ApiResult tagged;
+    ApiResult other;
+    std::thread a([&] { tagged = api.Post("/api/upstream/tunnel", json{{"via", "active"}}, 30000, kTag); });
+    std::thread b([&] { other = api.Get("/api/upstream/list"); });
+    CHECK(pf_test::WaitUntil(
+        [&] { return fg.TunnelsInProgress() == 1 && fg.CountPath("/api/upstream/list") == 1; }, 5000));
+    const ULONGLONG t0 = GetTickCount64();
+    api.Abort(kTag);
+    a.join();
+    CHECK_MSG(tagged.code == A::kCancelled, tagged.code.c_str());
+    CHECK_MSG(GetTickCount64() - t0 < 1000, "the tagged request ends at once");
+    b.join();
+    CHECK_MSG(other.ok(), "an untagged request is not touched");
+    fg.SetListDelayMs(0);
+    CHECK(api.Get("/api/upstream/list", 0, kTag).code == A::kCancelled);
+    CHECK_MSG(fg.CountPath("/api/upstream/list") == 1, "a refused tag sends nothing");
+    CHECK(api.Get("/api/upstream/list", 0, kTag + 1).ok());
+}
+
+// WINHTTP_DISABLE_REDIRECTS: a 302 is an answer like any other non-200 -- bad_response --
+// and the token never goes to the place it points at.
+void TestRedirectNotFollowed() {
+    FakeGhost fg;
+    FakeGhost elsewhere;
+    CHECK(fg.Start());
+    CHECK(elsewhere.Start());
+    fg.SetFixedAnswer(302, {{"Location", elsewhere.apiBase() + "/api/upstream/list"}}, "{\"status\":\"ok\"}");
+    FakeClock clock;
+    GhostApi api(Opts(fg, &clock));
+    const ApiResult r = api.Get("/api/upstream/list");
+    CHECK_MSG(r.code == A::kBadResponse, r.code.c_str());
+    CHECK(r.httpStatus == 302);
+    CHECK(fg.Requests().size() == 1);
+    CHECK_MSG(elsewhere.Requests().empty(), "the redirect is not followed");
+}
+
+// An answer longer than kMaxResponseBytes is bad_response, even when it is otherwise a
+// perfectly good answer.
+void TestOversizedAnswer() {
+    FakeGhost fg;
+    CHECK(fg.Start());
+    FakeClock clock;
+    GhostApi api(Opts(fg, &clock));
+    const std::string pad(pf::kMaxResponseBytes, 'x');
+    fg.SetFixedAnswer(200, {}, "{\"status\":\"ok\",\"pad\":\"" + pad + "\"}");
+    CHECK_MSG(api.Get("/api/upstream/list").code == A::kBadResponse, "over the limit");
+    // Control: the same shape under the limit is accepted.
+    fg.SetFixedAnswer(200, {}, "{\"status\":\"ok\",\"pad\":\"" + pad.substr(0, 1000) + "\"}");
+    CHECK(api.Get("/api/upstream/list").ok());
+}
+
 }  // namespace
 
 int main() {
@@ -241,5 +324,9 @@ int main() {
     TestUnusableConfig();
     TestTransportFailureNotRetried();
     TestShutdown();
+    TestShutdownAbortsRequestOnTheWire();
+    TestAbortByTag();
+    TestRedirectNotFollowed();
+    TestOversizedAnswer();
     return pf_test::TestExitCode();
 }

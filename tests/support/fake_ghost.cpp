@@ -41,6 +41,8 @@ const char* Reason(int status) {
     switch (status) {
         case 200:
             return "OK";
+        case 302:
+            return "Found";
         case 401:
             return "Unauthorized";
         case 403:
@@ -210,6 +212,17 @@ void FakeGhost::SetUdpMaxPayload(long long n) {
     std::lock_guard<std::mutex> lock(mu_);
     udpMaxPayload_ = n;
 }
+void FakeGhost::SetFixedAnswer(int status, std::vector<std::pair<std::string, std::string>> headers,
+                               std::string body) {
+    std::lock_guard<std::mutex> lock(mu_);
+    fixedStatus_ = status;
+    fixedHeaders_ = std::move(headers);
+    fixedBody_ = std::move(body);
+}
+void FakeGhost::SetListDelayMs(DWORD ms) {
+    std::lock_guard<std::mutex> lock(mu_);
+    listDelayMs_ = ms;
+}
 
 std::vector<FakeRequest> FakeGhost::Requests() const {
     std::lock_guard<std::mutex> lock(mu_);
@@ -313,9 +326,11 @@ void FakeGhost::Serve(SOCKET c) {
             const Answer a = Handle(req);
             if (a.drop) goto done;
             const bool close = Lower(req.Header("Connection")) == "close";
+            std::string extra;
+            for (const auto& h : a.headers) extra += h.first + ": " + h.second + "\r\n";
             std::string resp = "HTTP/1.1 " + std::to_string(a.status) + " " + Reason(a.status) +
                                "\r\nContent-Type: application/json\r\nContent-Length: " +
-                               std::to_string(a.body.size()) + "\r\n" +
+                               std::to_string(a.body.size()) + "\r\n" + extra +
                                (close ? "Connection: close\r\n" : "Connection: keep-alive\r\n") + "\r\n" + a.body;
             if (!SendAll(c, resp) || close) goto done;
         }
@@ -327,8 +342,16 @@ void FakeGhost::Serve(SOCKET c) {
 
 FakeGhost::Answer FakeGhost::Handle(const FakeRequest& req) {
     Answer a;
+    DWORD listDelay = 0;
     {
         std::lock_guard<std::mutex> lock(mu_);
+        if (fixedStatus_ != 0) {
+            a.status = fixedStatus_;
+            a.headers = fixedHeaders_;
+            a.body = fixedBody_;
+            return a;
+        }
+        listDelay = listDelayMs_;
         if (unauthorized_) {
             a.status = 401;
             a.body = ErrorBody("unauthorized");
@@ -342,6 +365,10 @@ FakeGhost::Answer FakeGhost::Handle(const FakeRequest& req) {
         }
     }
     if (req.method == "GET" && req.path == "/api/upstream/list") {
+        if (listDelay > 0 && WaitForSingleObject(stopEvent_, listDelay) != WAIT_TIMEOUT) {
+            a.drop = true;
+            return a;
+        }
         std::lock_guard<std::mutex> lock(mu_);
         if (!listBody_.empty()) {
             a.body = listBody_;

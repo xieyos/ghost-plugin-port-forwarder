@@ -7,6 +7,7 @@
 #include "build_info.h"
 #include "host_handshake.h"
 
+#include <winsock2.h>
 #include <windows.h>
 
 #include <exception>
@@ -73,6 +74,13 @@ int RunStandalone() {
 }  // namespace
 
 int wmain() {
+    // A Winsock reference for the whole life of the process, never released. Adopted tunnel
+    // sockets can outlive every object that took its own reference (the tunnel client, a
+    // forwarder); the last WSACleanup must never run under a live socket. The process exit
+    // releases it. A failure is not fatal here (the handshake must still be answered); every
+    // socket user then reports its own failure.
+    WSADATA wsa;
+    (void)WSAStartup(MAKEWORD(2, 2), &wsa);
     try {
         return pf::IsHosted() ? RunHosted() : RunStandalone();
     } catch (const std::exception&) {

@@ -1,11 +1,12 @@
 // What the forwarders need from Ghost: "is a tunnel possible at all" and "open one".
 //
 // An interface rather than a TunnelClient& for one reason: lifetime. A connection thread
-// can be inside OpenTunnel when the engine is told to stop, and that request cannot be
-// abandoned (its answer may carry a socket already duplicated into this process; see
-// ghost_api.h). Such a thread outlives Engine::Stop. It holds a shared_ptr to its
-// TunnelSource, and ClientTunnelSource holds shared_ptrs to the TunnelClient and to the
-// GhostApi it points into -- so neither is destroyed under a thread still using it.
+// can be inside OpenTunnel when the engine is told to stop. Shutdown() aborts that request,
+// but the thread still has to return through the client, and a thread waiting out a 429
+// backoff is not woken at all (see GhostApi::Abort); such a thread can outlive
+// Engine::Stop. It holds a shared_ptr to its TunnelSource, and ClientTunnelSource holds
+// shared_ptrs to the TunnelClient and to the GhostApi it points into -- so neither is
+// destroyed under a thread still using it.
 #pragma once
 
 #include "ghost_api.h"
@@ -31,9 +32,10 @@ public:
     virtual TunnelResult Open(EgressKind egress, const std::string& nodeId, Proto proto, const std::string& host,
                               int port) = 0;
 
-    // Ends every wait for a slot or a retry, now and from now on (TunnelClient::Shutdown).
-    // Does NOT shut the GhostApi down: the plugin's log shares it and still has a final
-    // batch to send. Its owner calls GhostApi::Shutdown after that.
+    // Ends every wait for a slot or a retry and aborts every tunnel request on the wire,
+    // now and from now on (TunnelClient::Shutdown). Does NOT shut the GhostApi down: the
+    // plugin's log shares it and still has a final batch to send. Its owner calls
+    // GhostApi::Shutdown after that.
     virtual void Shutdown() = 0;
 };
 

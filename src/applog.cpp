@@ -232,7 +232,20 @@ void AppLog::WriteLocal(const std::vector<Entry>& batch) {
     const std::wstring path = localDir_ + L"\\" + kLogFileName;
     if (FileSize(path) + text.size() > fileMaxBytes_) {
         const std::wstring old = path + L".1";
-        MoveFileExW(path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
+        if (!MoveFileExW(path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            // Replacing .1 fails while another program holds it without FILE_SHARE_DELETE
+            // (an editor, a log viewer). Losing this file's history beats growing past the
+            // limit for as long as that program keeps it open.
+            HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                                   TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        }
+        // Still no room (the file could not be emptied either, or this batch alone is over
+        // the limit): the batch is dropped.
+        if (FileSize(path) + text.size() > fileMaxBytes_) {
+            dropped_ += batch.size();
+            return;
+        }
     }
     if (AppendToFile(path, text)) {
         local_ += batch.size();

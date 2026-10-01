@@ -25,9 +25,10 @@
 //
 // Threads and stopping (see also engine.h): the accept thread is joined. Connection threads
 // are detached but tracked: SignalStop() makes every pump end within one slice, but a thread
-// can also be blocked where no flag reaches it -- in GetAddrInfoW, or waiting for Ghost's
-// answer to a tunnel request (which must not be abandoned: the answer may carry a socket
-// already duplicated into this process). WaitStopped() waits for them only until its
+// can also be blocked where no flag reaches it -- in GetAddrInfoW, or in a tunnel request
+// (the engine's final Stop aborts those through TunnelSource::Shutdown, but a 429 backoff
+// inside it is not woken, and Apply() does not abort anything: the client is shared by
+// every rule). WaitStopped() waits for them only until its
 // deadline. A thread still running after that ("a straggler") owns everything it touches
 // through a shared_ptr -- rule, stats, tunnel source, log function, a Winsock reference --
 // and closes its sockets when its call returns. Nothing it uses can be freed under it.

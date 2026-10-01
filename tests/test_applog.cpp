@@ -3,6 +3,7 @@
 // when log.write is not granted, in standalone mode and after a 401.
 
 #include "applog.h"
+#include "fake_clock.h"
 #include "fake_ghost.h"
 #include "test_support.h"
 #include "util_str.h"
@@ -63,19 +64,26 @@ void TestBatchingAndBucket() {
     FakeGhost fg;
     CHECK(fg.Start());
     auto api = MakeApi(fg);
+    // The log's clock is fake: the bucket sees all 25 writes at one instant (on a real clock
+    // a slow machine refills a token between writes), and the one-second spacing is read
+    // back as the waits the sender asked for.
+    pf_test::FakeClock clock;
     AppLogOptions o;
     o.api = api.get();
     o.canWrite = true;
+    o.clock = &clock;
     AppLog log(o);
     CHECK(log.Remote());
-    log.Start();
+    // Written before Start(), so that no wait of the sender moves the clock in between.
     for (int i = 0; i < 25; ++i) {
         log.Write(i % 3 == 0 ? LogLevel::Info : (i % 3 == 1 ? LogLevel::Warn : LogLevel::Error),
                   "entry " + std::to_string(i), {{"rule", "r" + std::to_string(i)}});
     }
     CHECK_MSG(log.Dropped() == 5, "burst of 20: five of 25 instant entries are dropped");
+    log.Start();
     CHECK(pf_test::WaitUntil([&] { return log.SentEntries() == 20; }, 8000));
     log.Stop();
+    CHECK(log.Dropped() == 5);
 
     const auto reqs = Ingests(fg);
     CHECK(reqs.size() >= 2);
@@ -97,11 +105,13 @@ void TestBatchingAndBucket() {
             ++next;
         }
         total += entries.size();
-        if (i > 0) {
-            CHECK_MSG(reqs[i].atMs - reqs[i - 1].atMs >= 900, "at most one request per second");
-        }
     }
     CHECK(total == 20);
+    // At most one request per second: the sender waited a full interval after every request
+    // but (possibly) the last.
+    const auto waits = clock.Waits();
+    CHECK_MSG(waits.size() + 1 >= reqs.size(), "a wait between every two requests");
+    for (uint32_t w : waits) CHECK(w == pf::kLogMinIntervalMs);
 }
 
 void TestStopFlushes() {
@@ -240,6 +250,50 @@ void TestLocalRolls() {
     CHECK(ReadFileUtf8(cur).find("line 29 ") != std::string::npos);
 }
 
+// Another program holds port-forwarder.log.1 without FILE_SHARE_DELETE, so the roll cannot
+// replace it. The current file is emptied instead of growing past the limit, and the held
+// file is left alone.
+void TestRollBlockedByReader() {
+    pf_test::ScopedTempDir dir;
+    const std::wstring cur = dir.path() + L"\\port-forwarder.log";
+    const std::wstring old = cur + L".1";
+    {
+        HANDLE h = CreateFileW(old.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(h != INVALID_HANDLE_VALUE);
+        DWORD n = 0;
+        WriteFile(h, "held\n", 5, &n, nullptr);
+        CloseHandle(h);
+    }
+    HANDLE reader =
+        CreateFileW(old.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(reader != INVALID_HANDLE_VALUE);
+
+    AppLogOptions o;
+    o.localDir = dir.path();
+    o.fileMaxBytes = 400;
+    o.burst = 1000;
+    o.ratePerSec = 1000;
+    uint64_t largest = 0;
+    {
+        AppLog log(o);
+        log.Start();
+        for (int i = 0; i < 30; ++i) {
+            log.Write(LogLevel::Info, "line " + std::to_string(i) + " " + std::string(40, 'x'));
+            const uint64_t want = static_cast<uint64_t>(i) + 1;
+            pf_test::WaitUntil([&] { return log.LocalEntries() + log.Dropped() == want; }, 2000);
+            const uint64_t size = ReadFileUtf8(cur).size();
+            if (size > largest) largest = size;
+        }
+        log.Stop();
+        CHECK(log.LocalEntries() + log.Dropped() == 30);
+        CHECK_MSG(log.LocalEntries() == 30, "emptying the file made room every time");
+    }
+    CloseHandle(reader);
+    CHECK_MSG(largest <= 400, "never past the limit while the roll is blocked");
+    CHECK(ReadFileUtf8(cur).find("line 29 ") != std::string::npos);
+    CHECK_MSG(ReadFileUtf8(old) == "held\n", "the held file is not touched");
+}
+
 }  // namespace
 
 int main() {
@@ -251,5 +305,6 @@ int main() {
     TestNotGrantedWritesLocally();
     TestUnauthorizedFallsBackToLocal();
     TestLocalRolls();
+    TestRollBlockedByReader();
     return pf_test::TestExitCode();
 }

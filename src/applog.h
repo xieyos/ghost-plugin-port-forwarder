@@ -8,6 +8,9 @@
 //   local   <dir>\port-forwarder.log, rolled at 1 MB to port-forwarder.log.1 (two files
 //           at most). Used when log.write is not granted, in standalone mode, and from the
 //           moment Ghost answers 401 (the token is gone; nothing will be accepted again).
+//           If the roll fails (another program holds port-forwarder.log.1 without
+//           FILE_SHARE_DELETE), the current file is emptied instead; if even that fails the
+//           batch is dropped. The file never grows past the limit.
 //
 // Entries are admitted through a local bucket of 2/s, burst 20 -- well under Ghost's
 // per-plugin entry budget of 5/s, burst 50, which the plugin shares with nothing else but
@@ -81,6 +84,9 @@ public:
     void Start();
     // Sends what is queued -- at most one more request -- then ends the thread. Entries
     // still queued after that are counted as dropped.
+    //
+    // Order at exit: AppLog::Stop() BEFORE GhostApi::Shutdown(). Shutdown cancels every
+    // wait and aborts every request on the wire, the last batch included.
     void Stop();
 
     void Write(LogLevel level, const std::string& text, const LogFields& fields = {});

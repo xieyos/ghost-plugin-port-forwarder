@@ -34,8 +34,8 @@ private:
 bool ParseNode(const json& j, NodeInfo* out) {
     NodeInfo n;
     if (!JsonGetString(j, "id", &n.id) || !IsNodeIdShaped(n.id)) return false;
-    if (!JsonGetString(j, "name", &n.name)) return false;
-    if (!JsonGetString(j, "type", &n.type)) return false;
+    if (!JsonGetString(j, "name", &n.name) || !IsNodeNameShaped(n.name)) return false;
+    if (!JsonGetString(j, "type", &n.type) || !IsNodeTypeShaped(n.type)) return false;
     if (!JsonGetBool(j, "active", &n.active)) return false;
     if (!JsonGetBool(j, "valid", &n.valid)) return false;
     if (!JsonGetBool(j, "udp", &n.udp)) return false;
@@ -51,6 +51,17 @@ bool ReadUint32(const json& j, const char* key, uint32_t* out) {
 }
 
 }  // namespace
+
+bool IsNodeNameShaped(const std::string& s) {
+    if (s.empty() || s.size() > 256) return false;
+    for (char c : s) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7f) return false;
+    }
+    return true;
+}
+
+bool IsNodeTypeShaped(const std::string& s) { return s == "socks5" || s == "http"; }
 
 NodeList ParseNodeList(const json& body) {
     NodeList r;
@@ -146,6 +157,7 @@ TunnelClient::~TunnelClient() {
 
 void TunnelClient::Shutdown() {
     if (cancel_) SetEvent(cancel_);
+    if (api_) api_->Abort(Tag());
 }
 
 NodeList TunnelClient::ListNodes(bool forceRefresh) {
@@ -158,20 +170,45 @@ NodeList TunnelClient::ListNodes(bool forceRefresh) {
         r.code = tunnel_err::kPermissionMissing;
         return r;
     }
-    std::lock_guard<std::mutex> lock(listMu_);
+    std::unique_lock<std::mutex> lock(listMu_);
     const uint64_t now = clock_->NowMs();
     if (!forceRefresh && haveList_ && now - listAt_ < listCacheMs_) return list_;
-    ApiResult a = api_->Get("/api/upstream/list", kListReceiveTimeoutMs);
-    if (!a.ok()) {
-        r.code = a.code;
-        return r;
+    if (fetching_) {
+        // Never two fetches at once, and never a page poll held up behind one: an old list
+        // now is better than a fresh one in five seconds.
+        if (haveList_) return list_;
+        const uint64_t gen = fetchGen_;
+        listCv_.wait(lock, [&] { return fetchGen_ != gen; });
+        return lastFetch_;
     }
-    r = ParseNodeList(a.body);
+    fetching_ = true;
+    lock.unlock();
+
+    // The network call runs without the lock. Nothing may escape between fetching_ = true
+    // and the notify below, or every later caller without a cached list waits forever.
+    try {
+        ApiResult a = api_->Get("/api/upstream/list", kListReceiveTimeoutMs, Tag());
+        if (!a.ok()) {
+            r.code = a.code;
+        } else {
+            r = ParseNodeList(a.body);
+        }
+    } catch (...) {
+        r = NodeList();
+        r.code = api_err::kBadResponse;
+    }
+
+    lock.lock();
     if (r.ok()) {
         list_ = r;
         haveList_ = true;
         listAt_ = clock_->NowMs();
     }
+    lastFetch_ = r;
+    fetching_ = false;
+    ++fetchGen_;
+    lock.unlock();
+    listCv_.notify_all();
     return r;
 }
 
@@ -242,7 +279,7 @@ TunnelResult TunnelClient::OpenOnce(const json& request, Proto proto) {
     TunnelResult r;
     // A request is put on the wire at most once here; GhostApi retries only 429s, which
     // are answered before Ghost does anything.
-    ApiResult a = api_->Post("/api/upstream/tunnel", request, kTunnelClientWaitMs);
+    ApiResult a = api_->Post("/api/upstream/tunnel", request, kTunnelClientWaitMs, Tag());
     if (!a.ok()) {
         r.code = a.code;
         return r;
@@ -274,8 +311,9 @@ TunnelResult TunnelClient::OpenOnce(const json& request, Proto proto) {
     auto it = a.body.find("node");
     if (it != a.body.end() && it->is_object()) node = &*it;
     if (!JsonGetString(a.body, "proto", &gotProto) || gotProto != ProtoName(proto) || !node ||
-        !JsonGetString(*node, "id", &r.node.id) || !JsonGetString(*node, "name", &r.node.name) ||
-        !JsonGetString(*node, "type", &r.node.type)) {
+        !JsonGetString(*node, "id", &r.node.id) || !IsNodeIdShaped(r.node.id) ||
+        !JsonGetString(*node, "name", &r.node.name) || !IsNodeNameShaped(r.node.name) ||
+        !JsonGetString(*node, "type", &r.node.type) || !IsNodeTypeShaped(r.node.type)) {
         r.sock.Reset();
         r.code = api_err::kBadResponse;
         return r;

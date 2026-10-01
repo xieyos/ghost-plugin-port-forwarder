@@ -107,7 +107,8 @@ void TestTcpAdoption() {
     CHECK(r.sock.valid());
     CHECK(r.node.id == "n1" && r.node.name == "Node One" && r.node.type == "socks5");
     CHECK(r.requests == 1);
-    CHECK(rig.echo.Connections() == 1);
+    // The echo server counts in its accept thread, which may not have run yet.
+    CHECK(pf_test::WaitUntil([&] { return rig.echo.Connections() == 1; }, 5000));
     if (r.sock.valid()) {
         CHECK(SockType(r.sock.get()) == SOCK_STREAM);
         CHECK_MSG(RoundTripTcp(r.sock.get(), "hello through the tunnel"), "TCP round trip on the adopted socket");
@@ -191,6 +192,12 @@ void TestBadAnswers() {
         {"proto in the answer differs", [](json& j) { j["proto"] = "udp"; }},
         {"node missing", [](json& j) { j.erase("node"); }},
         {"node.id not a string", [](json& j) { j["node"]["id"] = 1; }},
+        {"node.id not node-id shaped", [](json& j) { j["node"]["id"] = "n 1"; }},
+        {"node.name empty", [](json& j) { j["node"]["name"] = ""; }},
+        {"node.name with a control character", [](json& j) { j["node"]["name"] = "Node\nOne"; }},
+        {"node.name over 256 bytes", [](json& j) { j["node"]["name"] = std::string(257, 'n'); }},
+        {"node.type neither socks5 nor http", [](json& j) { j["node"]["type"] = "ftp"; }},
+        {"node.type in capitals", [](json& j) { j["node"]["type"] = "SOCKS5"; }},
     };
     for (const auto& c : cases) {
         Rig rig;
@@ -263,8 +270,10 @@ void TestPluginNotRunningRetried() {
 
 void TestLostAnswerSentOnce() {
     Rig rig;
-    // A pooled connection first, so that a client which kept connections alive would be
-    // tempted to resend on a fresh one when this one is cut.
+    // A request before the tunnel request. This does not provoke a resend by itself -- the
+    // client sends no keep-alive, so there is no pooled connection to be cut; what pins
+    // "sent once" is that, plus never retrying a lost answer. The count below would catch
+    // either being undone.
     CHECK(rig.tc->ListNodes().ok());
     rig.fg.SetTunnelDrop(true);
     TunnelResult r = rig.tc->OpenTunnel(EgressKind::Node, "n1", Proto::Tcp, "echo.test", 80);
@@ -345,6 +354,59 @@ void TestPreconditions() {
     CHECK(rig3.fg.Requests().empty());
 }
 
+// Shutdown() aborts this client's tunnel request on the wire: Ghost would answer in 10 s,
+// OpenTunnel returns `cancelled` within 1 s. The shared GhostApi stays usable for others.
+void TestShutdownAbortsTunnelRequest() {
+    Rig rig;
+    rig.fg.SetTunnelDelayMs(10000);
+    TunnelResult r;
+    std::thread t([&] { r = rig.tc->OpenTunnel(EgressKind::Node, "n1", Proto::Tcp, "echo.test", 80); });
+    CHECK(pf_test::WaitUntil([&] { return rig.fg.TunnelsInProgress() == 1; }, 5000));
+    const ULONGLONG t0 = GetTickCount64();
+    rig.tc->Shutdown();
+    t.join();
+    CHECK_MSG(r.code == A::kCancelled, r.code.c_str());
+    CHECK_MSG(GetTickCount64() - t0 < 1000, "OpenTunnel returns within 1 s of Shutdown");
+    CHECK(!r.sock.valid());
+    CHECK(r.requests == 1);
+    CHECK(rig.tc->InFlight() == 0);
+    CHECK_MSG(rig.api->Get("/api/upstream/list").ok(), "the GhostApi itself is not shut down");
+}
+
+// One fetch at a time: while a refresh is on the wire, a caller with a cached list gets it
+// at once; callers with nothing cached wait for that fetch and share its answer.
+void TestListNodesSingleFlight() {
+    {
+        Rig rig;
+        CHECK(rig.tc->ListNodes().ok());
+        rig.clock.Advance(pf::kNodeListCacheMs);  // expired
+        rig.fg.SetListDelayMs(1500);
+        pf::NodeList slow;
+        std::thread a([&] { slow = rig.tc->ListNodes(); });
+        CHECK(pf_test::WaitUntil([&] { return rig.fg.CountPath(kList) == 2; }, 5000));
+        const ULONGLONG t0 = GetTickCount64();
+        const pf::NodeList stale = rig.tc->ListNodes();
+        CHECK_MSG(GetTickCount64() - t0 < 500, "the stale list comes back at once");
+        CHECK(stale.ok() && stale.nodes.size() == 2);
+        a.join();
+        CHECK(slow.ok());
+        CHECK_MSG(rig.fg.CountPath(kList) == 2, "no second fetch while one is in progress");
+    }
+    {
+        Rig rig;
+        rig.fg.SetListDelayMs(1000);
+        pf::NodeList first;
+        pf::NodeList second;
+        std::thread a([&] { first = rig.tc->ListNodes(); });
+        CHECK(pf_test::WaitUntil([&] { return rig.fg.CountPath(kList) == 1; }, 5000));
+        std::thread b([&] { second = rig.tc->ListNodes(); });
+        a.join();
+        b.join();
+        CHECK(first.ok() && second.ok() && second.nodes.size() == 2);
+        CHECK_MSG(rig.fg.CountPath(kList) == 1, "nothing cached: the waiter shares the one fetch");
+    }
+}
+
 void TestListNodes() {
     Rig rig;
     pf::NodeList l = rig.tc->ListNodes();
@@ -368,9 +430,19 @@ void TestListNodes() {
     CHECK(rig.tc->ListNodes(/*forceRefresh=*/true).ok());
     CHECK(rig.fg.CountPath(kList) == 3);
 
-    // Failures are not cached.
+    // Failures are not cached: after the cached success expired, a failing fetch and then
+    // another call -- which must go out again, not answer the failure from a cache.
+    rig.clock.Advance(pf::kNodeListCacheMs);
     rig.fg.SetListBody(R"({"status":"ok","active":null,"nodes":{}})");
+    CHECK(rig.tc->ListNodes().code == A::kBadResponse);
+    CHECK(rig.fg.CountPath(kList) == 4);
+    CHECK(rig.tc->ListNodes().code == A::kBadResponse);
+    CHECK_MSG(rig.fg.CountPath(kList) == 5, "a failure is not cached");
     CHECK(rig.tc->ListNodes(true).code == A::kBadResponse);
+    // Entries with an odd name or type are skipped like any other odd entry.
+    rig.fg.SetListBody(R"({"status":"ok","active":"n1","nodes":[{"id":"n1","name":"","type":"socks5","active":true,"valid":true,"udp":true},{"id":"n2","name":"ok","type":"ftp","active":false,"valid":true,"udp":false},{"id":"n3","name":"Three","type":"http","active":false,"valid":true,"udp":false}]})");
+    l = rig.tc->ListNodes(true);
+    CHECK(l.ok() && l.nodes.size() == 1 && l.nodes[0].id == "n3");
     rig.fg.SetListBody(R"({"status":"ok","active":null,"nodes":[{"id":"n1","name":"x","type":"socks5","active":true,"valid":true,"udp":"yes"},{"id":"n7","name":"y","type":"http","active":false,"valid":false,"udp":false}]})");
     l = rig.tc->ListNodes(true);
     CHECK(l.ok() && !l.hasActive && l.nodes.size() == 1 && l.nodes[0].id == "n7" && !l.nodes[0].valid);
@@ -388,6 +460,8 @@ int main() {
     TestLostAnswerSentOnce();
     TestInFlightLimit();
     TestPreconditions();
+    TestShutdownAbortsTunnelRequest();
     TestListNodes();
+    TestListNodesSingleFlight();
     return pf_test::TestExitCode();
 }

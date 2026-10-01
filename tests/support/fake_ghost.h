@@ -89,6 +89,10 @@ public:
     // Applied to the real success answer (after the socket was duplicated).
     void SetTunnelMutator(std::function<void(pf::json&)> fn);
     void SetUdpMaxPayload(long long n);
+    // Every request (any route) gets exactly this answer: status, extra header lines, body.
+    // Nothing else is done -- no tunnel is opened. Status 0 turns it off.
+    void SetFixedAnswer(int status, std::vector<std::pair<std::string, std::string>> headers, std::string body);
+    void SetListDelayMs(DWORD ms);         // wait before answering upstream.list
 
     // ---- Observation ----
     std::vector<FakeRequest> Requests() const;
@@ -103,6 +107,7 @@ public:
 private:
     struct Answer {
         int status = 200;
+        std::vector<std::pair<std::string, std::string>> headers;  // extra header lines
         std::string body;
         bool drop = false;  // close the connection instead
     };
@@ -141,6 +146,10 @@ private:
     std::string tunnelFixedBody_;
     std::function<void(pf::json&)> tunnelMutator_;
     long long udpMaxPayload_ = 65497;
+    int fixedStatus_ = 0;
+    std::vector<std::pair<std::string, std::string>> fixedHeaders_;
+    std::string fixedBody_;
+    DWORD listDelayMs_ = 0;
 
     std::atomic<int> tunnelsInProgress_{0};
     std::atomic<int> udpEchoed_{0};
