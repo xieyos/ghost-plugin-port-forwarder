@@ -69,3 +69,7 @@ pf_add_test(test_applog functional
 pf_add_test(test_forward_tcp functional
   SOURCES test_forward_tcp.cpp
   LIBS pf_fake_ghost)
+
+pf_add_test(test_forward_udp functional
+  SOURCES test_forward_udp.cpp
+  LIBS pf_fake_ghost)

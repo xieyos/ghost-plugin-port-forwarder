@@ -5,12 +5,19 @@
 // echoed, and the server then shuts down its own sending side. It counts accepted
 // connections, so a test can assert that a refused tunnel reached the destination zero
 // times.
+//
+// UdpEchoServer sends every datagram back to where it came from. It counts the datagrams it
+// received and remembers each distinct source port, so a test can tell one forwarded
+// session from two, and assert that a refused relay reached the destination zero times.
 #pragma once
 
 #include "test_support.h"
 
+#include <mswsock.h>
+
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -107,6 +114,82 @@ private:
     std::thread accept_;
     std::mutex mu_;
     std::vector<std::thread> threads_;
+};
+
+class UdpEchoServer {
+public:
+    UdpEchoServer() = default;
+    ~UdpEchoServer() { Stop(); }
+    UdpEchoServer(const UdpEchoServer&) = delete;
+    UdpEchoServer& operator=(const UdpEchoServer&) = delete;
+
+    bool Start() {
+        sock_ = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0, WSA_FLAG_NO_HANDLE_INHERIT);
+        if (sock_ == INVALID_SOCKET) return false;
+        sockaddr_in a = {};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int len = sizeof(a);
+        // A reply to a forwarder socket that has closed must not end the echo loop.
+        BOOL off = FALSE;
+        DWORD bytes = 0;
+        WSAIoctl(sock_, SIO_UDP_CONNRESET, &off, sizeof(off), nullptr, 0, &bytes, nullptr, nullptr);
+        if (bind(sock_, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 ||
+            getsockname(sock_, reinterpret_cast<sockaddr*>(&a), &len) != 0) {
+            closesocket(sock_);
+            sock_ = INVALID_SOCKET;
+            return false;
+        }
+        port_ = ntohs(a.sin_port);
+        thread_ = std::thread([this] {
+            try {
+                Loop();
+            } catch (...) {
+            }
+        });
+        return true;
+    }
+
+    void Stop() {
+        stopping_ = true;
+        if (thread_.joinable()) thread_.join();
+        if (sock_ != INVALID_SOCKET) closesocket(sock_);
+        sock_ = INVALID_SOCKET;
+    }
+
+    unsigned short port() const { return port_; }
+    int Datagrams() const { return received_.load(); }
+    size_t DistinctSources() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return sources_.size();
+    }
+
+private:
+    void Loop() {
+        std::vector<char> buf(65536);
+        for (;;) {
+            if (!WaitReadable(sock_, stopping_)) return;
+            sockaddr_in from = {};
+            int len = sizeof(from);
+            const int n = recvfrom(sock_, buf.data(), static_cast<int>(buf.size()), 0,
+                                   reinterpret_cast<sockaddr*>(&from), &len);
+            if (n < 0) continue;
+            ++received_;
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                sources_.insert(ntohs(from.sin_port));
+            }
+            sendto(sock_, buf.data(), n, 0, reinterpret_cast<sockaddr*>(&from), len);
+        }
+    }
+
+    SOCKET sock_ = INVALID_SOCKET;
+    unsigned short port_ = 0;
+    std::atomic<bool> stopping_{false};
+    std::atomic<int> received_{0};
+    mutable std::mutex mu_;
+    std::set<unsigned short> sources_;
+    std::thread thread_;
 };
 
 }  // namespace pf_test

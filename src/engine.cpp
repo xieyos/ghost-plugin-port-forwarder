@@ -11,11 +11,12 @@ Engine::Engine(EngineOptions opts)
     ctx_.log = std::move(opts.log);
     ctx_.globalConnections = globalConnections_;
     ctx_.globalMax = opts.globalMaxConnections;
+    ctx_.clock = opts.clock;
 }
 
 Engine::~Engine() { Stop(); }
 
-void Engine::StopForwarders(std::vector<std::unique_ptr<TcpForwarder>> forwarders, DWORD budgetMs) {
+void Engine::StopForwarders(std::vector<std::unique_ptr<Forwarder>> forwarders, DWORD budgetMs) {
     // Every forwarder is told first, so that their connections close in parallel and one
     // budget covers them all.
     for (auto& f : forwarders) f->SignalStop();
@@ -26,7 +27,7 @@ void Engine::StopForwarders(std::vector<std::unique_ptr<TcpForwarder>> forwarder
 }
 
 void Engine::PruneRetired() const {
-    std::vector<std::unique_ptr<TcpForwarder>> keep;
+    std::vector<std::unique_ptr<Forwarder>> keep;
     for (auto& f : retired_) {
         if (f->ThreadsAlive() > 0) keep.push_back(std::move(f));
     }
@@ -40,7 +41,7 @@ void Engine::Apply(const std::vector<Rule>& rules) {
     // 1. Keep the forwarders of unchanged rules; everything else that runs is stopped.
     std::vector<Entry> old;
     old.swap(entries_);
-    std::vector<std::unique_ptr<TcpForwarder>> toStop;
+    std::vector<std::unique_ptr<Forwarder>> toStop;
     std::vector<Entry> next;
     next.reserve(rules.size());
     std::set<std::string> seen;
@@ -54,21 +55,21 @@ void Engine::Apply(const std::vector<Rule>& rules) {
             continue;
         }
         for (Entry& o : old) {
-            if (o.tcp && o.rule.id == r.id && o.rule == r) {
-                e.tcp = std::move(o.tcp);
+            if (o.fwd && o.rule.id == r.id && o.rule == r) {
+                e.fwd = std::move(o.fwd);
                 break;
             }
         }
         next.push_back(std::move(e));
     }
     for (Entry& o : old) {
-        if (o.tcp) toStop.push_back(std::move(o.tcp));
+        if (o.fwd) toStop.push_back(std::move(o.fwd));
     }
     StopForwarders(std::move(toStop), stopBudgetMs_);
 
     // 2. Start what is new or changed.
     for (Entry& e : next) {
-        if (e.tcp || !e.status.empty()) continue;
+        if (e.fwd || !e.status.empty()) continue;
         if (!e.rule.enabled) {
             e.status = rule_status::kDisabled;
             continue;
@@ -79,12 +80,12 @@ void Engine::Apply(const std::vector<Rule>& rules) {
             e.detail = bad;
             continue;
         }
-        if (e.rule.proto != Proto::Tcp) {
-            e.status = rule_status::kNotSupported;
-            continue;
+        if (e.rule.proto == Proto::Udp) {
+            e.fwd = std::make_unique<UdpForwarder>(e.rule, ctx_);
+        } else {
+            e.fwd = std::make_unique<TcpForwarder>(e.rule, ctx_);
         }
-        e.tcp = std::make_unique<TcpForwarder>(e.rule, ctx_);
-        e.tcp->Start();
+        e.fwd->Start();
     }
     entries_.swap(next);
     PruneRetired();
@@ -95,8 +96,8 @@ std::vector<RuleStatus> Engine::Snapshot() const {
     std::vector<RuleStatus> out;
     out.reserve(entries_.size());
     for (const Entry& e : entries_) {
-        if (e.tcp) {
-            out.push_back(e.tcp->Snapshot());
+        if (e.fwd) {
+            out.push_back(e.fwd->Snapshot());
             continue;
         }
         RuleStatus s;
@@ -120,9 +121,9 @@ void Engine::Stop() {
         } catch (...) {
         }
     }
-    std::vector<std::unique_ptr<TcpForwarder>> all;
+    std::vector<std::unique_ptr<Forwarder>> all;
     for (Entry& e : entries_) {
-        if (e.tcp) all.push_back(std::move(e.tcp));
+        if (e.fwd) all.push_back(std::move(e.fwd));
     }
     entries_.clear();
     StopForwarders(std::move(all), stopBudgetMs_);

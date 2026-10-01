@@ -355,13 +355,13 @@ void AcceptLoop(std::shared_ptr<TcpShared> sp, SOCKET listenSock) {
 
 }  // namespace
 
-std::string BindFailureDetail(int wsaError) {
+std::string BindFailureDetail(int wsaError, Proto proto) {
     std::string d = "WSA error " + std::to_string(wsaError);
     switch (wsaError) {
         case WSAEACCES:
-            d += ": access denied. Windows may reserve this port (Hyper-V, WSL, Docker): see "
-                 "`netsh interface ipv4 show excludedportrange protocol=tcp`; or another program holds "
-                 "it exclusively";
+            d += std::string(": access denied. Windows may reserve this port (Hyper-V, WSL, Docker): see "
+                             "`netsh interface ipv4 show excludedportrange protocol=") +
+                 ProtoName(proto) + "`; or another program holds it exclusively";
             break;
         case WSAEADDRINUSE:
             d += ": the address is already in use by another program";

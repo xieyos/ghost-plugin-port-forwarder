@@ -36,92 +36,42 @@
 // What is never logged: client addresses and per-connection destinations.
 #pragma once
 
-#include "applog.h"
-#include "rules.h"
-#include "stats.h"
-#include "tunnel_source.h"
+#include "forward_common.h"
 
 #include <windows.h>
 
-#include <atomic>
 #include <cstdint>
-#include <functional>
 #include <memory>
-#include <string>
 #include <thread>
 
 namespace pf {
 
-// A rule's state as the page shows it.
-namespace rule_status {
-constexpr const char* kListening = "listening";
-constexpr const char* kDisabled = "disabled";
-constexpr const char* kStopped = "stopped";
-constexpr const char* kBindFailed = "bind_failed";       // detail: "WSA error <n>" (+ a hint for 10013)
-constexpr const char* kInvalid = "invalid";              // detail: the validation code
-constexpr const char* kNotSupported = "not_supported";   // a rule kind this build cannot run
-constexpr const char* kNeedsGhost = tunnel_err::kNeedsGhost;
-constexpr const char* kPermissionMissing = tunnel_err::kPermissionMissing;
-constexpr const char* kGhostUnavailable = api_err::kGhostUnavailable;
-}  // namespace rule_status
-
-// lastError codes of our own (tunnel failures carry Ghost's or the client's code as is).
-namespace fwd_err {
-constexpr const char* kResolveFailed = "resolve_failed";      // GetAddrInfoW found nothing
-constexpr const char* kConnectFailed = "connect_failed";      // no address accepted within the timeout
-constexpr const char* kConnectionLimit = "connection_limit";  // maxConnections or the global limit
-constexpr const char* kBindFailed = "bind_failed";
-constexpr const char* kInternal = "internal_error";           // a socket call that should not fail did
-}  // namespace fwd_err
-
-constexpr int kGlobalMaxConnections = 1024;
 constexpr DWORD kDirectConnectTimeoutMs = 2000;
 constexpr size_t kPumpBufferBytes = 64 * 1024;
-constexpr DWORD kPollSliceMs = 250;
-
-using LogFn = std::function<void(LogLevel, const std::string&, const LogFields&)>;
-
-struct RuleStatus {
-    std::string id;
-    std::string status;  // rule_status
-    std::string detail;
-    StatsSnapshot stats;
-};
-
-// What every forwarder of one engine shares.
-struct ForwardContext {
-    std::shared_ptr<TunnelSource> tunnel;  // null = standalone
-    LogFn log;                             // may be empty
-    std::shared_ptr<std::atomic<int>> globalConnections;  // null = a private counter
-    int globalMax = kGlobalMaxConnections;
-};
-
-// The detail text for a bind failure.
-std::string BindFailureDetail(int wsaError);
 
 struct TcpShared;  // forward_tcp.cpp
 
-class TcpForwarder {
+class TcpForwarder final : public Forwarder {
 public:
     TcpForwarder(const Rule& rule, ForwardContext ctx);
     // SignalStop + WaitStopped with a 3 s budget.
-    ~TcpForwarder();
+    ~TcpForwarder() override;
     TcpForwarder(const TcpForwarder&) = delete;
     TcpForwarder& operator=(const TcpForwarder&) = delete;
 
     // Opens the listener and the accept thread, or sets the status that says why not.
-    void Start();
+    void Start() override;
     // Every thread of this rule ends what it is doing: the listener closes, every pump
     // closes both its sockets within one poll slice. Returns at once.
-    void SignalStop();
+    void SignalStop() override;
     // Joins the accept thread and waits for the connection threads until `deadlineTick`
     // (GetTickCount64). True when none is left.
-    bool WaitStopped(uint64_t deadlineTick);
+    bool WaitStopped(uint64_t deadlineTick) override;
 
-    RuleStatus Snapshot() const;
+    RuleStatus Snapshot() const override;
     // Connection threads still running (after WaitStopped: the stragglers).
-    int ThreadsAlive() const;
-    const Rule& rule() const;
+    int ThreadsAlive() const override;
+    const Rule& rule() const override;
 
 private:
     std::shared_ptr<TcpShared> s_;

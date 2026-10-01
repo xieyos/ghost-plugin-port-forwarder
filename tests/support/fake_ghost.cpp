@@ -620,9 +620,16 @@ bool FakeGhost::OpenUdp(std::string* infoB64, std::string* code) {
 void FakeGhost::UdpEcho(SOCKET s, std::shared_ptr<std::atomic<bool>> close) {
     std::vector<char> buf(65536);
     for (;;) {
-        // Stops on Stop() or on CloseUdpRelays() for this relay.
-        if (close->load() || !WaitReadable(s, stopping_)) break;
-        if (close->load()) break;
+        // Stops on Stop() or on CloseUdpRelays() for this relay -- both checked every 50 ms
+        // while waiting (WaitReadable alone watches only stopping_, so a relay asked to
+        // close stayed open until the next datagram arrived, and swallowed that datagram).
+        if (close->load() || stopping_.load()) break;
+        WSAPOLLFD p = {};
+        p.fd = s;
+        p.events = POLLRDNORM;
+        const int ready = WSAPoll(&p, 1, 50);
+        if (ready == 0) continue;
+        if (ready < 0 || close->load()) break;
         const int n = recv(s, buf.data(), static_cast<int>(buf.size()), 0);
         if (n < 0) {
             const int e = WSAGetLastError();

@@ -68,6 +68,7 @@ add_library(pf_core STATIC
   src/applog.cpp
   src/engine.cpp
   src/forward_tcp.cpp
+  src/forward_udp.cpp
   src/ghost_api.cpp
   src/host_handshake.cpp
   src/local_addrs.cpp

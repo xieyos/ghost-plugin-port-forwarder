@@ -1,9 +1,11 @@
-// The rule engine: the running forwarders for the current rule set.
+// The rule engine: the running forwarders for the current rule set -- a TcpForwarder
+// (forward_tcp.h) for each enabled TCP rule, a UdpForwarder (forward_udp.h) for each
+// enabled UDP rule.
 //
 // Apply(rules) matches rules by id. A rule whose every field is unchanged (Rule's
 // operator==) keeps its forwarder -- its listener, its open connections and its counters
 // survive. A rule that changed, was disabled or was removed is stopped, which closes all of
-// its connections; a new or changed enabled rule is started with fresh counters. Rules are
+// its connections (UDP: its sessions); a new or changed enabled rule is started with fresh counters. Rules are
 // stopped before any is started, so a rule that moved to a port another rule just left can
 // bind it.
 //
@@ -20,10 +22,12 @@
 // in name resolution, or in a 429 backoff inside the API client. Such a thread is left
 // running: it owns what it uses through shared_ptrs (see forward_tcp.h) and closes its
 // sockets when its call returns. Joining it instead would make Stop() as slow as the
-// resolver. StragglerThreads() counts them; the process may exit with them running.
+// resolver. StragglerThreads() counts them (UDP rules: open workers, which block the same
+// way); the process may exit with them running.
 #pragma once
 
 #include "forward_tcp.h"
+#include "forward_udp.h"
 #include "rules.h"
 #include "tunnel_source.h"
 
@@ -44,6 +48,9 @@ struct EngineOptions {
     LogFn log;
     int globalMaxConnections = kGlobalMaxConnections;
     DWORD stopBudgetMs = kEngineStopBudgetMs;
+    // UDP session idleness and the failed-open cache (forward_udp.h). Null = DefaultClock().
+    // Must outlive the engine.
+    Clock* clock = nullptr;
 };
 
 class Engine {
@@ -70,14 +77,14 @@ public:
 private:
     struct Entry {
         Rule rule;
-        std::unique_ptr<TcpForwarder> tcp;  // null when the rule does not run
-        std::string status;                 // used when tcp is null
+        std::unique_ptr<Forwarder> fwd;  // null when the rule does not run
+        std::string status;              // used when fwd is null
         std::string detail;
     };
 
     // Signals `forwarders`, then waits for them all within one budget; those with threads
     // left over move to retired_.
-    void StopForwarders(std::vector<std::unique_ptr<TcpForwarder>> forwarders, DWORD budgetMs);
+    void StopForwarders(std::vector<std::unique_ptr<Forwarder>> forwarders, DWORD budgetMs);
     void PruneRetired() const;
 
     ForwardContext ctx_;
@@ -87,7 +94,7 @@ private:
     mutable std::mutex mu_;
     bool stopped_ = false;
     std::vector<Entry> entries_;
-    mutable std::vector<std::unique_ptr<TcpForwarder>> retired_;
+    mutable std::vector<std::unique_ptr<Forwarder>> retired_;
 };
 
 }  // namespace pf

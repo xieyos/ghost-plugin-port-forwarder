@@ -1,7 +1,7 @@
 // Per-rule counters, read by the management page.
 //
 // Every counter is an atomic written by the rule's own threads (accept thread, one pump
-// thread per connection; the UDP thread for the two datagram counters) and read by
+// thread per connection; for a UDP rule its one poll thread writes them all) and read by
 // Snapshot() from any thread. lastError is the one compound value and has its own lock.
 //
 // lastError.count is how many times IN A ROW the same code was recorded: a node that keeps
@@ -36,12 +36,12 @@ struct LastError {
 
 struct StatsSnapshot {
     uint64_t activeConnections = 0;
-    uint64_t totalConnections = 0;     // accepted and handed to a pump thread
+    uint64_t totalConnections = 0;     // TCP: accepted and handed to a pump thread; UDP: sessions created
     uint64_t rejectedConnections = 0;  // closed at once: a connection limit was reached
     uint64_t bytesUp = 0;              // client -> remote, bytes the remote side accepted
     uint64_t bytesDown = 0;            // remote -> client, bytes the client side accepted
-    uint64_t udpSessions = 0;
-    uint64_t droppedDatagrams = 0;
+    uint64_t udpSessions = 0;          // UDP sessions open now (including those being opened)
+    uint64_t droppedDatagrams = 0;     // UDP datagrams not forwarded, for any reason
     LastError lastError;
 };
 
