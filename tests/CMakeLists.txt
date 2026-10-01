@@ -65,3 +65,7 @@ pf_add_test(test_tunnel_client functional
 pf_add_test(test_applog functional
   SOURCES test_applog.cpp
   LIBS pf_fake_ghost)
+
+pf_add_test(test_forward_tcp functional
+  SOURCES test_forward_tcp.cpp
+  LIBS pf_fake_ghost)

@@ -66,6 +66,8 @@ add_link_options(/guard:cf /CETCOMPAT)
 # ---- pf_core: everything except main.cpp (the tests link it) --------------------
 add_library(pf_core STATIC
   src/applog.cpp
+  src/engine.cpp
+  src/forward_tcp.cpp
   src/ghost_api.cpp
   src/host_handshake.cpp
   src/local_addrs.cpp
