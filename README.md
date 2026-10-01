@@ -8,7 +8,7 @@
 
 ## 中文
 
-一个 [Ghost Proxifier](https://github.com/liliBestCoder/ghost-plugin-sdk) 插件：把本机端口转发到远端地址。每条规则一个监听端口（TCP 或 UDP），出口可以是**直连**、**Ghost 当前激活的上游节点**，或**指定的某个 Ghost 节点**。在 Ghost 的插件中心里管理，也能脱离 Ghost 独立运行（仅直连）。
+一个 Ghost Proxifier 插件（基于 [Ghost Proxifier 插件 SDK](https://github.com/liliBestCoder/ghost-plugin-sdk)）：把本机端口转发到远端地址。每条规则一个监听端口（TCP 或 UDP），出口可以是**直连**、**Ghost 当前激活的上游节点**，或**指定的某个 Ghost 节点**。在 Ghost 的插件中心里管理，也能脱离 Ghost 独立运行（仅直连）。
 
 灵感来自 [Jackarain/portmap](https://github.com/Jackarain/portmap)——一条 TCP 映射加一份配置文件；它自己的待办（SOCKS5、Web 管理、统计、多条映射）正是这里做的事，只不过代理这一半交给了 Ghost：**本插件里没有任何代理协议代码**。经节点的连接由 Ghost 建好、把连好的 socket 交给本插件（权限 `upstream.connect`），本插件只搬字节，节点的地址与凭据从不离开 Ghost。
 
@@ -75,14 +75,14 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-产物 `build/Release/port-forwarder.exe`。版本号只有一个来源：`manifest.json` 的 `version`。打包检查（`test_pack`）需要 Python ≥ 3.9 与一份 [ghost-plugin-sdk](https://github.com/liliBestCoder/ghost-plugin-sdk) 检出（默认在本仓库旁边的 `../ghost-plugin-sdk`，或设环境变量 `GHOST_PLUGIN_SDK` / `-DPF_GHOST_SDK_DIR=`）；缺了就显示 Skipped。
+产物 `build/Release/port-forwarder.exe`。版本号只有一个来源：`manifest.json` 的 `version`。打包检查（`test_pack`）需要 Python ≥ 3.9 与一份 [ghost-plugin-sdk](https://github.com/liliBestCoder/ghost-plugin-sdk) 检出（默认在本仓库旁边的 `../ghost-plugin-sdk`，或设环境变量 `GHOST_PLUGIN_SDK` / `-DPF_GHOST_SDK_DIR=`）；缺了就显示 Skipped。检出是 git 仓库时，它的 HEAD 必须是 `.github/workflows/ci.yml` 里钉住的 `SDK_REF`，否则检查失败。
 
 ### 发版（维护者）
 
 推一个 `v<版本>` 标签，`.github/workflows/release.yml` 构建、测试、用 SDK 的 `gpkg.py` 打包与签名，并建 GitHub Release（三个资产：`ghost-plugin.json`、`ghost-plugin.json.sig`、`.gpkg`）。一次性准备：
 
 1. `python <sdk>/tools/plugin/gpkg.py keygen --out <仓库之外的目录>`；
-2. 把 `dev-public.b64` 提交到仓库根（工作流用它复核签名）；
+2. 把 `dev-public.b64` 提交到仓库根（工作流用它复核签名；构建开始前先检查它存在且是 64 字节的公钥，缺了直接失败）；
 3. 把 `dev-private.pem` 的全部内容存成仓库 secret `GHOST_DEV_KEY_PEM`，本地那份离线保管。
 
 私钥永远不进仓库（`.gitignore` 挡着 `*.pem`、`*.key`、`.keys/`）。
@@ -95,7 +95,7 @@ MIT，见 [LICENSE](LICENSE)。第三方：nlohmann/json（MIT），见 [THIRD_P
 
 ## English
 
-A [Ghost Proxifier](https://github.com/liliBestCoder/ghost-plugin-sdk) plugin that forwards local ports to remote hosts. Each rule is one listening port (TCP or UDP); its egress is **direct**, **Ghost's active upstream node**, or **a chosen Ghost node**. You manage it from Ghost's plugin center, or run it on its own without Ghost (direct only).
+A Ghost Proxifier plugin (built on the [Ghost Proxifier plugin SDK](https://github.com/liliBestCoder/ghost-plugin-sdk)) that forwards local ports to remote hosts. Each rule is one listening port (TCP or UDP); its egress is **direct**, **Ghost's active upstream node**, or **a chosen Ghost node**. You manage it from Ghost's plugin center, or run it on its own without Ghost (direct only).
 
 Inspired by [Jackarain/portmap](https://github.com/Jackarain/portmap) -- one TCP mapping and a config file; its own to-do list (SOCKS5, web management, statistics, many mappings) is what this plugin does, except that the proxy half is Ghost's: **there is no proxy protocol code in this plugin**. For a via-node rule Ghost connects through the node and hands the connected socket over (permission `upstream.connect`); the plugin only moves bytes, and the node's address and credentials never leave Ghost.
 
@@ -162,14 +162,14 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The result is `build/Release/port-forwarder.exe`. The version has one source: `version` in `manifest.json`. The packing check (`test_pack`) needs Python 3.9+ and a checkout of [ghost-plugin-sdk](https://github.com/liliBestCoder/ghost-plugin-sdk) (by default `../ghost-plugin-sdk` next to this repository, or set `GHOST_PLUGIN_SDK` / `-DPF_GHOST_SDK_DIR=`); without them it shows as Skipped.
+The result is `build/Release/port-forwarder.exe`. The version has one source: `version` in `manifest.json`. The packing check (`test_pack`) needs Python 3.9+ and a checkout of [ghost-plugin-sdk](https://github.com/liliBestCoder/ghost-plugin-sdk) (by default `../ghost-plugin-sdk` next to this repository, or set `GHOST_PLUGIN_SDK` / `-DPF_GHOST_SDK_DIR=`); without them it shows as Skipped. When the checkout is a git repository, its HEAD must be the `SDK_REF` pinned in `.github/workflows/ci.yml`, or the check fails.
 
 ### Releasing (maintainer)
 
 Push a `v<version>` tag: `.github/workflows/release.yml` builds, tests, packs and signs with the SDK's `gpkg.py`, and creates the GitHub Release with three assets (`ghost-plugin.json`, `ghost-plugin.json.sig`, the `.gpkg`). One-time setup:
 
 1. `python <sdk>/tools/plugin/gpkg.py keygen --out <a directory outside the repository>`;
-2. commit `dev-public.b64` at the repository root (the workflow verifies the signature with it);
+2. commit `dev-public.b64` at the repository root (the workflow verifies the signature with it, and checks before building that it exists and holds a 64-byte public key);
 3. store the whole of `dev-private.pem` as the repository secret `GHOST_DEV_KEY_PEM`, and keep the local copy offline.
 
 The private key never goes into the repository (`.gitignore` blocks `*.pem`, `*.key`, `.keys/`).

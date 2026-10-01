@@ -17,7 +17,11 @@ Then the invariants of these workflows:
   * every `uses:` is pinned to a 40-hex commit with a `# vX.Y.Z` comment;
   * SDK_REPO / SDK_REF are the same in both files, SDK_REF a 40-hex commit;
   * release.yml: the SDK_REF guard runs before any checkout, the secret is named exactly once,
-    and pip installs with --require-hashes --only-binary=:all:.
+    and pip installs with --require-hashes --only-binary=:all:;
+  * release.yml: the build job's first step after its checkout checks dev-public.b64 (exists,
+    not empty, 88 base64 characters, 64 bytes) before any build, test or upload step;
+  * release.yml: publishing updates an existing release with `gh release upload --clobber`
+    (a re-run) and creates it with --verify-tag otherwise.
 
 Usage: check_workflows.py <.github/workflows directory>
 """
@@ -295,6 +299,70 @@ def env_values(text, key):
     return re.findall(r"^\s+%s:\s*(\S+)\s*$" % re.escape(key), text, re.M)
 
 
+PUBKEY_STEP = "- name: dev-public.b64 is a 64-byte public key"
+STEP_RE = re.compile(r"\n      - ")
+
+
+def step_text(text, start):
+    """The step that starts at `start`, up to the next step or job."""
+    m = re.compile(r"\n      - |\n  [A-Za-z0-9_-]+:\n").search(text, start + 1)
+    return text[start:m.start() if m else len(text)]
+
+
+def pubkey_check_problems(rel):
+    """release.yml's build job checks dev-public.b64 right after its checkout: the release job
+    verifies the signed descriptor with that file only after the build, the pack and the
+    signing -- a missing or malformed key must fail first, not last."""
+    out = []
+    build = rel.find("\n  build:")
+    release = rel.find("\n  release:")
+    if build < 0 or release < build:
+        return ["release.yml: no build job before the release job"]
+    job = rel[build:release]
+    step = job.find(PUBKEY_STEP)
+    if step < 0:
+        return ["release.yml: the build job has no step '%s'" % PUBKEY_STEP[len("- name: "):]]
+    body = step_text(job, step)
+    for needle, what in (("Test-Path -LiteralPath dev-public.b64", "requires the file to exist"),
+                         ("$text.Length -eq 0", "refuses an empty file"),
+                         ("'^[A-Za-z0-9+/]{86}==\\z'", "requires 88 standard base64 characters"),
+                         ("FromBase64String($text).Length -ne 64", "requires 64 decoded bytes")):
+        if needle not in body:
+            out.append("release.yml: the dev-public.b64 step no longer %s (%s)" % (what, needle))
+    checkout = job.find("uses: actions/checkout@")
+    if checkout < 0:
+        return out + ["release.yml: the build job has no checkout"]
+    # The first step after the checkout ...
+    nxt = STEP_RE.search(job, checkout)
+    if not nxt or nxt.end() - len("- ") != step:
+        out.append("release.yml: the dev-public.b64 step must be the first step after the build job's checkout")
+    # ... and so before every step that does work.
+    for work in ("run: cmake ", "run: ctest ", "- name: Assemble pkg/", "uses: actions/upload-artifact@"):
+        at = job.find(work)
+        if at < 0:
+            out.append("release.yml: the build job has no '%s' (the order check would be vacuous)" % work)
+        elif at < step:
+            out.append("release.yml: '%s' runs before the dev-public.b64 step" % work)
+    return out
+
+
+def publish_problems(rel):
+    """A re-run of the release job after a successful `gh release create` uploads with --clobber
+    instead of failing on "already exists"; the create still insists on the pushed tag."""
+    out = []
+    at = rel.find("- name: Publish the GitHub Release")
+    if at < 0:
+        return ["release.yml: no 'Publish the GitHub Release' step"]
+    body = step_text(rel, at)
+    if 'gh release view "$GITHUB_REF_NAME"' not in body:
+        out.append("release.yml: publishing does not first ask whether the release exists")
+    if not re.search(r"gh release upload [^\n]*--clobber", body):
+        out.append("release.yml: an existing release is not updated with gh release upload --clobber")
+    if not re.search(r"gh release create [^\n]*--verify-tag", body):
+        out.append("release.yml: gh release create must keep --verify-tag")
+    return out
+
+
 def main(argv):
     if len(argv) != 2:
         print("usage: check_workflows.py <.github/workflows>")
@@ -356,6 +424,8 @@ def main(argv):
             problems.append("release.yml: pip must install with --require-hashes --only-binary=:all:")
         if 'trap \'rm -f "$key"\' EXIT' not in rel or "$RUNNER_TEMP/dev-private.pem" not in rel:
             problems.append("release.yml: the key goes to $RUNNER_TEMP and a trap removes it")
+        problems.extend(pubkey_check_problems(rel))
+        problems.extend(publish_problems(rel))
 
     for p in problems:
         print("FAIL: " + p)

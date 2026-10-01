@@ -35,6 +35,33 @@ jobs:
         with:
           persist-credentials: false
 
+      # The release job verifies the signed descriptor with the committed dev-public.b64 --
+      # after this job's build and test, after packing and signing. A missing or malformed key
+      # file fails here instead, before any work. The form is the one gpkg.py's _read_pubkey
+      # accepts (SDK_REF): standard padded base64 of exactly 64 bytes (raw P-256 X||Y), 88
+      # characters; trailing space, tab, CR and LF allowed, nothing else stripped.
+      - name: dev-public.b64 is a 64-byte public key
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath dev-public.b64 -PathType Leaf)) {
+            Write-Output "::error::dev-public.b64 is missing -- commit the public half of the signing key (gpkg.py keygen)"
+            exit 1
+          }
+          $raw = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath dev-public.b64))
+          $text = [System.Text.Encoding]::ASCII.GetString($raw).TrimEnd([char[]]" `t`r`n")
+          if ($text.Length -eq 0) {
+            Write-Output "::error::dev-public.b64 is empty"
+            exit 1
+          }
+          if ($text -cnotmatch '^[A-Za-z0-9+/]{86}==\z') {
+            Write-Output "::error::dev-public.b64 must be standard base64 of exactly 64 bytes (88 characters ending in ==), got $($text.Length) characters"
+            exit 1
+          }
+          if ([Convert]::FromBase64String($text).Length -ne 64) {
+            Write-Output "::error::dev-public.b64 does not decode to 64 bytes"
+            exit 1
+          }
+
       - name: The tag is v<manifest version>
         id: tag
         shell: pwsh
@@ -169,7 +196,15 @@ jobs:
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+        # A re-run after a successful create must not fail on "release already exists": the
+        # assets are uploaded again over the existing ones (all three, so the descriptor, its
+        # signature and the package stay one set).
         run: |
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "Port Forwarder ${GITHUB_REF_NAME#v}" --notes "See CHANGELOG.md." \
-            dist/ghost-plugin.json dist/ghost-plugin.json.sig dist/*.gpkg
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/ghost-plugin.json dist/ghost-plugin.json.sig dist/*.gpkg
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "Port Forwarder ${GITHUB_REF_NAME#v}" --notes "See CHANGELOG.md." \
+              dist/ghost-plugin.json dist/ghost-plugin.json.sig dist/*.gpkg
+          fi

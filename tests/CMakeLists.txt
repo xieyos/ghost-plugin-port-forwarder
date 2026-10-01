@@ -96,6 +96,10 @@ pf_add_test(test_end_to_end integration
   ARGS "$<TARGET_FILE:port-forwarder>"
   DEPENDS port-forwarder
   LIBS pf_fake_ghost)
+# Its bounded waits add up to more than the default 60 s (three plugin runs, each with
+# start-up, status and exit waits, plus up to 10 s per log line): a slow machine must reach the
+# test's own failure messages, not CTest's kill.
+set_tests_properties(test_end_to_end PROPERTIES TIMEOUT 180)
 
 # The shipped exe's load-time imports: static CRT, system DLLs only, nothing newer than 1607.
 pf_add_test(test_imports unit

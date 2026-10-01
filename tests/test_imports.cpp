@@ -6,8 +6,8 @@
 //   * Static CRT (/MT): no VCRUNTIME*, MSVCP*, CONCRT*, ucrtbase or api-ms-win-crt-* import. The
 //     plugin runs on machines without the Visual C++ redistributable; with /MD the host's spawn
 //     would end in a loader dialog nobody sees and a "plugin crashed" in Ghost.
-//   * Every imported DLL is on a short list of system DLLs. A new dependency must be added here
-//     on purpose.
+//   * Every imported DLL -- load-time or delay-loaded -- is on a short list of system DLLs. A
+//     new dependency must be added here on purpose.
 //   * Windows 10 1607 is the floor: none of the listed APIs newer than it is a load-time import
 //     (a missing entry point makes the loader refuse to start the process at all). This is a
 //     list, not an audit of every import -- a new call to a newer API needs a new row.
@@ -96,7 +96,8 @@ public:
         return Fail(why, "no terminator after 4096 descriptors");
     }
 
-    // DLL names of the delay-loaded imports (not resolved at load time; listed for the record).
+    // DLL names of the delay-loaded imports (not resolved at load time, but held to the same
+    // system list).
     bool DelayDlls(std::vector<std::string>* out, std::string* why) const {
         if (delayDir_.VirtualAddress == 0) return true;
         size_t desc = 0;
@@ -253,6 +254,10 @@ int wmain(int argc, wchar_t** argv) {
     for (const auto& d : delay) {
         std::printf("delay-load: %s\n", d.c_str());
         CHECK_MSG(!IsCrtDll(d), ("a delay-loaded C runtime DLL: " + d).c_str());
+        // Delay-loaded is still loaded: a DLL missing from the machine fails the first call
+        // into it instead of the start. The same list applies.
+        CHECK_MSG(AllowedDlls().count(Lower(d)) == 1,
+                  ("a delay-loaded DLL that is not on the system list: " + d).c_str());
     }
     for (const auto& i : imports) {
         const auto it = TooNew().find(i.name);

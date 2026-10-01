@@ -16,6 +16,12 @@ this test made up.
 Usage: test_pack.py --sdk <ghost-plugin-sdk checkout> --exe <port-forwarder.exe>
                     --src <repository root> [--require]
 
+The SDK must be the commit CI and the release pack with: when the SDK directory is a git
+checkout, its HEAD has to equal the SDK_REF pinned in .github/workflows/ci.yml (which
+check_workflows.py keeps equal to release.yml's). A packer from another commit could pass here
+and fail -- or pack differently -- in the release. Only a directory that is not a git checkout
+(an extracted archive, say) skips this comparison, and says so.
+
 Exit 77 (CTest: Skipped) when the SDK checkout is missing, unless --require (CI) -- then 1.
 """
 
@@ -23,6 +29,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -50,6 +57,44 @@ def sha256(path):
     return h.hexdigest()
 
 
+def pinned_sdk_ref(src):
+    """The SDK_REF in .github/workflows/ci.yml, or None (with the reason printed)."""
+    path = os.path.join(src, ".github", "workflows", "ci.yml")
+    try:
+        with open(path, "rb") as f:
+            text = f.read().decode("utf-8")
+    except OSError as e:
+        print("cannot read %s: %s" % (path, e), flush=True)
+        return None
+    refs = re.findall(r"^\s+SDK_REF:\s*(\S+)\s*$", text, re.M)
+    if len(refs) != 1 or not re.match(r"^[0-9a-f]{40}$", refs[0]):
+        print("%s must set SDK_REF exactly once, to a 40-hex commit: %r" % (path, refs), flush=True)
+        return None
+    return refs[0]
+
+
+def check_sdk_commit(sdk, src):
+    """The SDK checkout is the pinned commit (a git checkout), or not a git checkout at all."""
+    pinned = pinned_sdk_ref(src)
+    check(pinned is not None, "ci.yml pins SDK_REF")
+    if pinned is None:
+        return
+    if not os.path.exists(os.path.join(sdk, ".git")):
+        print("the SDK at %s is not a git checkout (no .git) -- its commit cannot be compared with "
+              "SDK_REF %s; packing with it as it is" % (sdk, pinned), flush=True)
+        return
+    try:
+        r = subprocess.run(["git", "-C", sdk, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        check(False, "the SDK is a git checkout but `git rev-parse HEAD` could not run: %s" % e)
+        return
+    head = r.stdout.strip()
+    check(r.returncode == 0 and head == pinned,
+          "the SDK checkout at %s is at %s, but ci.yml pins SDK_REF %s -- check out that commit "
+          "(git -C <sdk> checkout %s) or update SDK_REF in both workflows"
+          % (sdk, head or ("<rev-parse failed: %s>" % r.stderr.strip()), pinned, pinned))
+
+
 def run_pack(gpkg, src, out, min_app):
     return subprocess.run(
         [sys.executable, gpkg, "pack", "--src", src, "--out", out, "--min-app-version", min_app],
@@ -68,6 +113,8 @@ def main():
     if not os.path.isfile(gpkg):
         print("the SDK's gpkg.py is not at %s (set GHOST_PLUGIN_SDK or -DPF_GHOST_SDK_DIR)" % gpkg, flush=True)
         return 1 if a.require else SKIP
+
+    check_sdk_commit(a.sdk, a.src)
 
     with open(os.path.join(a.src, "manifest.json"), "rb") as f:
         manifest = json.loads(f.read().decode("utf-8"))

@@ -3,19 +3,26 @@
 // management page's API -- what the user's clicks send.
 //
 //   1. Hosted: the receipt carries a valid uiUrl. Three rules are added through the page
-//      API -- direct TCP, TCP through node n1, UDP through Ghost's active node -- and each
-//      carries a round trip to an echo destination. The tunnel requests Ghost saw name exactly
-//      what the rules say.
+//      API -- direct TCP, TCP through node n1, UDP through Ghost's active node (to a host name
+//      made up for this run) -- and each carries a round trip to an echo destination. The
+//      tunnel requests Ghost saw name exactly what the rules say.
 //   2. Ghost refuses the next tunnel: the client connection is closed, the destination sees
 //      ZERO connections (fail closed, never a direct fallback) and the rule reports the code.
 //   3. A rule is disabled and enabled again; log.write carries the start line and the rule
-//      lines, and no line anywhere carries a client's port or a per-connection destination.
+//      lines, and no line anywhere carries a client's port or the destination a tunnel was
+//      opened to.
 //   4. The stop event ends the process with code 0 within 3 s.
 //   5. Restarted on the same data directory: the three rules are back, with the same ids, and
 //      forward again.
 //   6. Standalone on the same data directory (--no-browser --data-dir): stdin is not read, the
 //      page answers, the direct rule forwards, and the two rules that need Ghost report
 //      needs_ghost and hold neither port.
+//
+// The three listen ports are held by this test (port_reserve.h) whenever the plugin is not
+// holding them, so nothing else on the machine can take one in between: the protocol a rule
+// does not use stays held throughout; the one it uses is released just before the plugin
+// binds it and taken back as soon as the plugin has let go (a rule disabled, the plugin
+// stopped).
 //
 // argv[1] = path of port-forwarder.exe.
 
@@ -42,6 +49,10 @@ using pf_test::HttpReply;
 namespace {
 
 std::wstring g_exe;
+
+// The via-node UDP rule's remote host: a name made up for this run, so the only way it can
+// reach a log line is the plugin writing it there (see LogCarriesNoClientAddresses).
+std::string g_udpHost;
 
 // ---- The page API, as the page calls it ------------------------------------------------
 
@@ -117,12 +128,32 @@ json RuleBody(const std::string& name, const char* proto, int listenPort, const 
 std::string AddRule(const Page& page, const json& body) {
     long long port = 0;
     if (body.contains("listen") && body["listen"].is_object()) pf::JsonGetInt64(body["listen"], "port", &port);
-    pf_test::ReleasePort(static_cast<int>(port));  // held until the plugin binds it
+    std::string proto;
+    pf::JsonGetString(body, "proto", &proto);
+    // Held until the plugin binds it; the protocol the rule does not use stays held.
+    pf_test::ReleaseOne(static_cast<int>(port), proto == "udp" ? pf_test::Proto::Udp : pf_test::Proto::Tcp);
     const HttpReply r = page.Post("api/rules", body);
     std::string id;
     pf::JsonGetString(pf::ParseJsonNoThrow(r.body), "id", &id);
     CHECK_MSG(r.status == 200 && !id.empty(), (std::to_string(r.status) + " " + r.body).c_str());
     return id;
+}
+
+// ---- The listen ports, held by the test whenever the plugin is not ----------------------
+
+// The protocol each of the three rules listens with (direct tcp, node tcp, node udp).
+const pf_test::Proto kRuleProto[3] = {pf_test::Proto::Tcp, pf_test::Proto::Tcp, pf_test::Proto::Udp};
+
+void ReleaseAll(const int ports[3]) {
+    for (int i = 0; i < 3; ++i) pf_test::ReleaseOne(ports[i], kRuleProto[i]);
+}
+
+// The plugin has let go of `ports` (or is about to, within the wait): take them back.
+void HoldAgain(const int ports[3], const char* when) {
+    for (int i = 0; i < 3; ++i) {
+        CHECK_UNTIL(pf_test::HoldOne(ports[i], kRuleProto[i]), 5000,
+                    std::string(when) + ": port " + std::to_string(ports[i]) + " could not be held again");
+    }
 }
 
 // ---- Clients -------------------------------------------------------------------------
@@ -164,19 +195,6 @@ bool UdpRoundTrip(int port, const std::string& msg, std::set<unsigned short>* cl
     const int n = recvfrom(s.get(), buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &len);
     return n == static_cast<int>(msg.size()) && std::string(buf, static_cast<size_t>(n)) == msg &&
            ntohs(from.sin_port) == port;
-}
-
-// Nothing holds 127.0.0.1:port for UDP (an exclusive bind succeeds).
-bool CanBindUdp(int port) {
-    pf::UniqueSocket u(WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0, WSA_FLAG_NO_HANDLE_INHERIT));
-    if (!u) return false;
-    BOOL one = TRUE;
-    setsockopt(u.get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&one), sizeof(one));
-    sockaddr_in a = {};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = htons(static_cast<u_short>(port));
-    return bind(u.get(), reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
 }
 
 // `n` appears in `text` as a token of its own: neither neighbour is a letter or a digit, so a
@@ -268,7 +286,7 @@ void HostedRun(FakeGhost& ghost, pf_test::TcpEchoServer& echo, const std::string
                                          json{{"kind", "direct"}}));
     ids->nodeTcp = AddRule(page, RuleBody("node tcp", "tcp", ports[1], "127.0.0.1", echo.port(),
                                           json{{"kind", "node"}, {"nodeId", "n1"}}));
-    ids->nodeUdp = AddRule(page, RuleBody("node udp", "udp", ports[2], "echo.test", 9, json{{"kind", "active"}}));
+    ids->nodeUdp = AddRule(page, RuleBody("node udp", "udp", ports[2], g_udpHost, 9, json{{"kind", "active"}}));
     for (const std::string* id : {&ids->direct, &ids->nodeTcp, &ids->nodeUdp}) {
         CHECK_UNTIL(page.Status(*id) == "listening", 5000, page.Describe());
     }
@@ -288,7 +306,7 @@ void HostedRun(FakeGhost& ghost, pf_test::TcpEchoServer& echo, const std::string
         CHECK_MSG(tunnels[0] == json({{"via", "node"}, {"nodeId", "n1"}, {"proto", "tcp"}, {"host", "127.0.0.1"},
                                       {"port", echo.port()}}),
                   pf::DumpSafe(tunnels[0]).c_str());
-        CHECK_MSG(tunnels[1] == json({{"via", "active"}, {"proto", "udp"}, {"host", "echo.test"}, {"port", 9}}),
+        CHECK_MSG(tunnels[1] == json({{"via", "active"}, {"proto", "udp"}, {"host", g_udpHost}, {"port", 9}}),
                   pf::DumpSafe(tunnels[1]).c_str());
     }
 
@@ -305,13 +323,15 @@ void HostedRun(FakeGhost& ghost, pf_test::TcpEchoServer& echo, const std::string
         }
     }
     CHECK_UNTIL(page.LastError(ids->nodeTcp) == "upstream_unreachable", 5000, page.Describe());
-    CHECK_MSG(!pf_test::WaitUntil([&] { return echo.Connections() != echoBefore; }, 1000),
+    CHECK_MSG(!pf_test::WaitUntil([&] { return echo.Connections() != echoBefore; }, 2000),
               "the destination saw no connection: no direct fallback");
     ghost.SetTunnelError("");
 
     // ---- 3. Disable and enable a rule; what log.write carried ----
     CHECK(page.Post("api/rules/" + ids->direct + "/disable", json::object()).status == 200);
-    CHECK_UNTIL(pf_test::CanBindTcp(ports[0]), 5000, page.Describe());
+    // The plugin lets go of the port: the test holds it until the rule is back.
+    CHECK_UNTIL(pf_test::HoldOne(ports[0], pf_test::Proto::Tcp), 5000, page.Describe());
+    pf_test::ReleaseOne(ports[0], pf_test::Proto::Tcp);
     CHECK(page.Post("api/rules/" + ids->direct + "/enable", json::object()).status == 200);
     CHECK_UNTIL(page.Status(ids->direct) == "listening", 5000, page.Describe());
     CHECK_MSG(TcpRoundTrip(ports[0], "hello again", clientPorts), "direct TCP after re-enabling");
@@ -323,13 +343,19 @@ void HostedRun(FakeGhost& ghost, pf_test::TcpEchoServer& echo, const std::string
 
     // ---- 4. Stop ----
     StopHosted(c, ev);
+    HoldAgain(ports, "after the hosted run");
     // The last batch went out before the exit; the whole log is now known.
     CHECK(LogHas(ghost, "Port Forwarder stopping"));
     CloseHandle(ev);
 }
 
-// No line sent to log.write carries a client's port or the per-connection destination of
-// the UDP rule.
+// No line sent to log.write carries a client's port (every client above recorded its own) or
+// the destination a tunnel was opened to. The latter is checked on the via-node UDP rule: the
+// host every one of its tunnel requests named (seen in section 1) is g_udpHost, made up for this
+// run. The rule's own lines ("rule added: <name>" and the like, app.cpp Commit) carry its name,
+// id, protocol and egress kind, never its remote -- so the name can only appear if a line about a
+// session or a tunnel wrote where it was going. Should a rule line ever carry the remote it is
+// configured with, this check has to learn to tell the two apart; it must not simply be dropped.
 void LogCarriesNoClientAddresses(const FakeGhost& ghost, const std::set<unsigned short>& clientPorts) {
     const std::vector<std::string> bodies = LogBodies(ghost);
     CHECK(!bodies.empty());
@@ -338,7 +364,8 @@ void LogCarriesNoClientAddresses(const FakeGhost& ghost, const std::set<unsigned
         for (unsigned short p : clientPorts) {
             CHECK_MSG(!ContainsNumber(b, p), ("a client port in a log line: " + std::to_string(p) + " in " + b).c_str());
         }
-        CHECK_MSG(b.find("echo.test") == std::string::npos, b.c_str());
+        CHECK_MSG(b.find(g_udpHost) == std::string::npos,
+                  ("the tunnel destination " + g_udpHost + " in a log line: " + b).c_str());
     }
 }
 
@@ -349,6 +376,7 @@ void RestartKeepsRules(FakeGhost& ghost, const std::string& dataDir, const int p
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, pf::Utf8ToWide(name).c_str());
     Child c(g_exe);
     Page page;
+    ReleaseAll(ports);  // the three rules listen again from the start
     const bool started = StartHosted(c, ghost, name, dataDir, &page);
     CHECK_MSG(started, "restarted, page answering");
     if (started) {
@@ -368,6 +396,7 @@ void RestartKeepsRules(FakeGhost& ghost, const std::string& dataDir, const int p
         CHECK_MSG(UdpRoundTrip(ports[2], "after restart, udp", &ignored), "udp via node after restart");
     }
     StopHosted(c, ev);
+    HoldAgain(ports, "after the restart");
     if (ev) CloseHandle(ev);
 }
 
@@ -375,6 +404,9 @@ void RestartKeepsRules(FakeGhost& ghost, const std::string& dataDir, const int p
 
 void StandaloneRun(const std::wstring& dataDir, const int ports[3], const Ids& ids) {
     Child c(g_exe);
+    // All three are let go, not only the direct rule's: a plugin that wrongly bound a rule
+    // needing Ghost must be able to, or the check below could not see it.
+    ReleaseAll(ports);
     CHECK(c.Start({}, {L"--no-browser", L"--data-dir", dataDir}));
     const std::string probe = "unread";
     CHECK(c.WriteStdin(probe));  // no newline: a line reader would block before printing
@@ -394,8 +426,12 @@ void StandaloneRun(const std::wstring& dataDir, const int ports[3], const Ids& i
     CHECK_UNTIL(page.Status(ids.nodeUdp) == "needs_ghost", 5000, page.Describe());
     std::set<unsigned short> ignored;
     CHECK_MSG(TcpRoundTrip(ports[0], "standalone, direct", &ignored), "the direct rule forwards standalone");
-    CHECK_MSG(pf_test::CanBindTcp(ports[1]), "a rule that needs Ghost does not listen standalone (tcp)");
-    CHECK_MSG(CanBindUdp(ports[2]), "a rule that needs Ghost does not listen standalone (udp)");
+    // Taking them back is the check: the exclusive bind succeeds only if the plugin does not
+    // hold the port -- and from here on they are the test's again.
+    CHECK_MSG(pf_test::HoldOne(ports[1], pf_test::Proto::Tcp),
+              "a rule that needs Ghost does not listen standalone (tcp)");
+    CHECK_MSG(pf_test::HoldOne(ports[2], pf_test::Proto::Udp),
+              "a rule that needs Ghost does not listen standalone (udp)");
     CHECK_MSG(c.StdinUnread() == probe.size(), "standalone never reads stdin");
 
     CHECK(page.Post("api/quit", json::object()).status == 200);
@@ -418,6 +454,8 @@ int wmain(int argc, wchar_t** argv) {
         return 2;
     }
     g_exe = Backslashes(argv[1]);
+    g_udpHost =
+        "pf-e2e-udp-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + ".test";
 
     pf_test::WinsockScope wsa;
     CHECK(wsa.ok());
