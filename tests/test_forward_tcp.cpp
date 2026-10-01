@@ -17,8 +17,10 @@
 #include "tunnel_client.h"
 #include "tunnel_source.h"
 
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -45,11 +47,16 @@ namespace {
 
 const char* kTunnel = "/api/upstream/tunnel";
 
-// A port that was free a moment ago (bound to 127.0.0.1:0, then released).
+// A port that was free a moment ago (bound to 127.0.0.1:0, then released), never the same
+// one twice in this process: two rules of one test given the same port would conflict.
 int FreePort() {
-    pf_test::LoopbackListener l;
-    if (!pf_test::ListenLoopback(&l)) return 0;
-    return l.port;
+    static std::set<int> handed;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        pf_test::LoopbackListener l;
+        if (!pf_test::ListenLoopback(&l)) return 0;
+        if (handed.insert(l.port).second) return l.port;
+    }
+    return 0;
 }
 
 Rule MakeRule(const char* id, int listenPort, const std::string& host, int remotePort,
@@ -581,6 +588,284 @@ void TestApplyRestartsOnlyChanged() {
     e.Stop();
 }
 
+
+// "localhost" resolves to ::1 first on most machines, while the destination listens on
+// 127.0.0.1 only. A refused loopback connect is retried by Windows for about 2 s, so trying
+// the addresses one after another costs that much; staggered attempts (RFC 8305) do not.
+void TestDirectStaggeredConnect() {
+    TcpEchoServer echo;
+    CHECK(echo.Start());
+    {
+        ADDRINFOW hints = {};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        ADDRINFOW* list = nullptr;
+        if (GetAddrInfoW(L"localhost", L"80", &hints, &list) == 0 && list) {
+            std::printf("   localhost resolves %s first\n", list->ai_family == AF_INET6 ? "::1" : "127.0.0.1");
+            FreeAddrInfoW(list);
+        }
+    }
+    Engine e(EngineOptions{});
+    const int port = FreePort();
+    e.Apply({MakeRule("r_0000000000000070", port, "localhost", echo.port())});
+    const ULONGLONG t0 = GetTickCount64();
+    UniqueSocket c = Connect(port);
+    CHECK(c.valid() && RoundTrip(c.get(), "staggered"));
+    const ULONGLONG took = GetTickCount64() - t0;
+    std::printf("   connected through localhost in %llu ms\n", took);
+    CHECK_MSG(took < 1000, "a dead first address does not cost the 2 s connect budget");
+    CHECK(echo.Connections() == 1);
+    e.Stop();
+}
+
+// Every way a tunnel can fail closes the client and never reaches the destination.
+void TestFailClosedRows() {
+    // The remote is the echo server's own address: a direct fallback would reach it.
+    struct Row {
+        const char* name;
+        std::function<void(FakeGhost&)> setup;
+        std::string code;
+    };
+    const std::vector<Row> rows = {
+        {"answer dropped", [](FakeGhost& fg) { fg.SetTunnelDrop(true); }, pf::api_err::kGhostUnreachable},
+        {"malformed protocolInfo",
+         [](FakeGhost& fg) {
+             fg.SetTunnelFixedBody(R"({"status":"ok","proto":"tcp","protocolInfo":"!!not base64!!",)"
+                                   R"("protocolInfoBytes":628,"node":{"id":"n1","name":"N","type":"socks5"}})");
+         },
+         pf::api_err::kBadResponse},
+    };
+    for (const Row& row : rows) {
+        GhostRig rig;
+        row.setup(rig.fg);
+        EngineOptions o;
+        o.tunnel = rig.source;
+        Engine e(o);
+        const int port = FreePort();
+        e.Apply({MakeRule("r_0000000000000071", port, "127.0.0.1", rig.echo.port(), EgressKind::Node, "n1")});
+        UniqueSocket c = Connect(port);
+        CHECK_MSG(c.valid() && ClosedByPeer(c.get()), row.name);
+        CHECK(pf_test::WaitUntil([&] { return Find(e, "r_0000000000000071").stats.lastError.code == row.code; },
+                                 5000));
+        CHECK_MSG(Find(e, "r_0000000000000071").stats.lastError.code == row.code, row.name);
+        CHECK_MSG(rig.echo.Connections() == 0, row.name);
+        CHECK(rig.fg.CountPath(kTunnel) == 1);
+        e.Stop();
+    }
+    // Stop while the tunnel request is on the wire.
+    {
+        GhostRig rig;
+        rig.fg.SetTunnelDelayMs(8000);
+        EngineOptions o;
+        o.tunnel = rig.source;
+        Engine e(o);
+        const int port = FreePort();
+        e.Apply({MakeRule("r_0000000000000072", port, "127.0.0.1", rig.echo.port(), EgressKind::Node, "n1")});
+        UniqueSocket c = Connect(port);
+        CHECK(c.valid());
+        CHECK(pf_test::WaitUntil([&] { return rig.fg.TunnelsInProgress() == 1; }, 5000));
+        e.Stop();
+        CHECK(ClosedByPeer(c.get()));
+        CHECK_MSG(rig.echo.Connections() == 0, "stop during the request: the destination saw ZERO connections");
+    }
+}
+
+// lastError.count is the number of failures in a row: a connection that works ends the run.
+void TestSuccessEndsErrorRun() {
+    GhostRig rig;
+    rig.fg.QueueTunnelErrors({"upstream_unreachable", "upstream_unreachable"});
+    EngineOptions o;
+    o.tunnel = rig.source;
+    Engine e(o);
+    const int port = FreePort();
+    const std::string id = "r_0000000000000073";
+    e.Apply({MakeRule(id.c_str(), port, "echo.test", 7, EgressKind::Node, "n1")});
+    for (int i = 0; i < 2; ++i) {
+        UniqueSocket c = Connect(port);
+        CHECK(c.valid() && ClosedByPeer(c.get()));
+    }
+    CHECK(pf_test::WaitUntil([&] { return Find(e, id).stats.lastError.count == 2; }, 5000));
+    UniqueSocket ok = Connect(port);
+    CHECK(ok.valid() && RoundTrip(ok.get(), "works"));
+    ok.Reset();
+    rig.fg.SetTunnelError("upstream_unreachable");
+    UniqueSocket c = Connect(port);
+    CHECK(c.valid() && ClosedByPeer(c.get()));
+    CHECK(pf_test::WaitUntil(
+        [&] {
+            const auto st = Find(e, id).stats;
+            return st.totalConnections == 4 && st.activeConnections == 0;
+        },
+        5000));
+    const auto st = Find(e, id).stats;
+    CHECK(st.lastError.code == "upstream_unreachable");
+    CHECK_MSG(st.lastError.count == 1, "a success between failures starts a new run");
+    e.Stop();
+}
+
+// A rule that is not listening (here: its port was taken) is started again when the same
+// rule set is applied again, instead of being kept as it is.
+void TestReapplyRetriesBind() {
+    TcpEchoServer echo;
+    CHECK(echo.Start());
+    auto holder = std::make_unique<pf_test::LoopbackListener>();
+    CHECK(pf_test::ListenLoopback(holder.get()));
+    const int port = holder->port;
+    Engine e(EngineOptions{});
+    const Rule r = MakeRule("r_0000000000000074", port, "127.0.0.1", echo.port());
+    e.Apply({r});
+    CHECK(Find(e, r.id).status == S::kBindFailed);
+    holder.reset();
+    e.Apply({r});
+    CHECK_MSG(Find(e, r.id).status == S::kListening, "re-applying an unchanged bind_failed rule retries the bind");
+    UniqueSocket c = Connect(port);
+    CHECK(c.valid() && RoundTrip(c.get(), "bound now"));
+    e.Stop();
+}
+
+// Stop() called while Apply() is stopping a rule whose connection thread cannot be woken
+// (a 429 backoff inside the API client) keeps to its own budget: Apply's wait ends early,
+// and Apply starts nothing after it. A second, unchanged rule has a stuck connection too,
+// so Stop() itself may have to wait up to its whole budget: without the early end the two
+// waits add up (about 3 s here, against well under 1 s with it).
+void TestStopDuringApply() {
+    GhostRig rig;
+    rig.fg.Set429Always(true);
+    LogSink log;
+    EngineOptions o;
+    o.tunnel = rig.source;
+    o.log = log.Fn();
+    Engine e(o);  // default budget: 2 s
+    const int p1 = FreePort();
+    const int p2 = FreePort();
+    const int p3 = FreePort();
+    Rule r = MakeRule("r_0000000000000075", p1, "echo.test", 7, EgressKind::Node, "n1");
+    const Rule kept = MakeRule("r_0000000000000076", p3, "echo.test", 7, EgressKind::Node, "n1");
+    e.Apply({r, kept});
+    UniqueSocket waiting = Connect(p1);
+    UniqueSocket waiting2 = Connect(p3);
+    CHECK(waiting.valid() && waiting2.valid());
+    // Both threads are in the backoff (three requests each; the next waits are 1, 2, 4 s).
+    CHECK(pf_test::WaitUntil([&] { return rig.fg.CountPath(kTunnel) >= 6; }, 10000));
+
+    r.listenPort = p2;  // changed: Apply stops the old forwarder and waits for its thread
+    std::thread applier([&] { e.Apply({r, kept}); });
+    CHECK(pf_test::WaitUntil([&] { return Refused(p1); }, 5000));  // Apply is in its wait
+    const ULONGLONG t0 = GetTickCount64();
+    e.Stop();
+    const ULONGLONG took = GetTickCount64() - t0;
+    applier.join();
+    std::printf("   Stop() during Apply() took %llu ms\n", took);
+    CHECK_MSG(took < 2500, "Stop() during Apply() keeps to its own budget");
+    CHECK_MSG(Refused(p2), "the changed rule is not listening after Stop()");
+    CHECK_MSG(!log.AnyContains("listening on 127.0.0.1:" + std::to_string(p2)),
+              "Apply() started nothing once Stop() was requested");
+    CHECK(e.Snapshot().empty());
+    rig.api->Shutdown();
+    CHECK(pf_test::WaitUntil([&] { return e.StragglerThreads() == 0; }, 5000));
+    CHECK(rig.echo.Connections() == 0);
+}
+
+
+// An accept error that is neither "nothing to take" nor "reset" (out of buffers) is recorded
+// and followed by a one-slice pause, not retried at once: the listener stays readable, so an
+// immediate retry spins. Four injected failures therefore delay the connection by about
+// four slices, and the rule keeps listening.
+void TestAcceptErrorsDoNotSpin() {
+    TcpEchoServer echo;
+    CHECK(echo.Start());
+    Engine e(EngineOptions{});
+    const int port = FreePort();
+    const std::string id = "r_0000000000000077";
+    e.Apply({MakeRule(id.c_str(), port, "127.0.0.1", echo.port())});
+    pf::testing::InjectAcceptErrors(4, WSAENOBUFS);
+    const ULONGLONG t0 = GetTickCount64();
+    UniqueSocket c = Connect(port);
+    CHECK(c.valid() && RoundTrip(c.get(), "after the errors"));
+    const ULONGLONG took = GetTickCount64() - t0;
+    pf::testing::InjectAcceptErrors(0, 0);
+    std::printf("   accepted after four errors in %llu ms\n", took);
+    CHECK_MSG(took >= 4 * pf::kPollSliceMs - 100, "each accept error is followed by a pause of one slice");
+    const auto s = Find(e, id);
+    CHECK(s.status == S::kListening);
+    CHECK(s.stats.lastError.code == pf::fwd_err::kInternal);
+    CHECK(s.stats.lastError.count == 4);
+    e.Stop();
+}
+
+// A connected loopback pair: `server` is the accepted end, non-blocking.
+struct Pair {
+    pf_test::LoopbackListener listener;
+    UniqueSocket client;
+    UniqueSocket server;
+    explicit Pair(int clientRcvBuf = 0) {
+        CHECK(pf_test::ListenLoopback(&listener));
+        client.Reset(WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
+                                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT));
+        if (clientRcvBuf > 0) {
+            setsockopt(client.get(), SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&clientRcvBuf),
+                       sizeof(clientRcvBuf));
+        }
+        sockaddr_in a = {};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons(listener.port);
+        CHECK(connect(client.get(), reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+        server.Reset(accept(listener.sock, nullptr, nullptr));
+        u_long one = 1;
+        CHECK(server.valid() && ioctlsocket(server.get(), FIONBIO, &one) == 0);
+        if (clientRcvBuf > 0) {
+            // Loopback otherwise buffers tens of megabytes on the sending side.
+            setsockopt(server.get(), SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&clientRcvBuf),
+                       sizeof(clientRcvBuf));
+        }
+    }
+};
+
+// What the pump does for the healthy side when the other side fails: deliver what is
+// buffered, then the EOF -- and no EOF when not everything could be delivered in time.
+void TestFlushThenShutdown() {
+    {
+        Pair p;
+        const std::string data = Pattern(1024 * 1024 + 3);
+        std::string got;
+        bool eof = false;
+        std::thread reader([&] { eof = RecvUntilEof(p.client.get(), &got); });
+        size_t sent = 0;
+        const bool all = pf::detail::FlushThenShutdown(p.server.get(), data.data(), data.size(), 2000, nullptr, &sent);
+        reader.join();
+        CHECK(all && sent == data.size());
+        CHECK_MSG(eof && got == data, "the reader gets every buffered byte and then a clean EOF");
+    }
+    {
+        // Nobody reads, and the server's send backlog is already full: the budget runs out.
+        // (Windows accepts a whole non-blocking send of any size while the backlog is below
+        // its limit, so the backlog is filled first with small sends until WSAEWOULDBLOCK.)
+        Pair p(8 * 1024);
+        const std::string chunk = Pattern(16 * 1024);
+        std::string prefilled;
+        for (int i = 0; i < 64 * 1024; ++i) {
+            const int n = send(p.server.get(), chunk.data(), static_cast<int>(chunk.size()), 0);
+            if (n <= 0) break;
+            prefilled.append(chunk.data(), static_cast<size_t>(n));
+        }
+        CHECK(WSAGetLastError() == WSAEWOULDBLOCK);
+        const std::string data = Pattern(1024 * 1024);
+        size_t sent = 0;
+        const ULONGLONG t0 = GetTickCount64();
+        const bool all = pf::detail::FlushThenShutdown(p.server.get(), data.data(), data.size(), 200, nullptr, &sent);
+        const ULONGLONG took = GetTickCount64() - t0;
+        CHECK(!all && sent < data.size());
+        CHECK_MSG(took >= 150 && took < 1000, "the flush keeps to its budget");
+        DWORD tmo = 1500;
+        setsockopt(p.client.get(), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+        std::string got;
+        CHECK_MSG(!RecvUntilEof(p.client.get(), &got), "no EOF after an incomplete flush");
+        CHECK(got.size() == prefilled.size() + sent);
+        CHECK(got.substr(prefilled.size()) == data.substr(0, sent));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -603,5 +888,12 @@ int main() {
     run("stop is bounded", TestStopIsBounded);
     run("stop leaves a straggler behind", TestStopLeavesStragglerBehind);
     run("apply restarts only the changed rule", TestApplyRestartsOnlyChanged);
+    run("direct: staggered connect", TestDirectStaggeredConnect);
+    run("fail closed rows", TestFailClosedRows);
+    run("a success ends the error run", TestSuccessEndsErrorRun);
+    run("re-apply retries a failed bind", TestReapplyRetriesBind);
+    run("stop during apply", TestStopDuringApply);
+    run("accept errors do not spin", TestAcceptErrorsDoNotSpin);
+    run("flush then shutdown", TestFlushThenShutdown);
     return pf_test::TestExitCode();
 }

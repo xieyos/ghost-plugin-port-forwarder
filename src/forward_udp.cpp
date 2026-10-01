@@ -1,5 +1,6 @@
 #include "forward_udp.h"
 
+#include "resolve.h"
 #include "util_str.h"
 
 #include <winsock2.h>
@@ -40,6 +41,8 @@ struct UdpShared {
     Clock* clock;
     RuleStats stats;
     std::atomic<bool> stop{false};
+    // Signalled with `stop`: cancels a worker's name lookup, ends a listener error's pause.
+    HANDLE stopEvent = nullptr;
     bool wsaOk = false;
 
     mutable std::mutex mu;
@@ -62,6 +65,7 @@ struct UdpShared {
 
     UdpShared(const Rule& r, ForwardContext c) : rule(r), ctx(std::move(c)) {
         clock = ctx.clock ? ctx.clock : DefaultClock();
+        stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         // A Winsock reference of our own: a straggler worker may outlive every other user.
         WSADATA d;
         wsaOk = WSAStartup(MAKEWORD(2, 2), &d) == 0;
@@ -71,6 +75,7 @@ struct UdpShared {
         results.clear();
         wakeRecv.Reset();
         wakeSend.Reset();
+        if (stopEvent) CloseHandle(stopEvent);
         if (wsaOk) WSACleanup();
     }
     UdpShared(const UdpShared&) = delete;
@@ -160,26 +165,36 @@ bool DisableIcmpResets(SOCKET s) {
            WSAIoctl(s, SIO_UDP_NETRESET, &off, sizeof(off), nullptr, 0, &bytes, nullptr, nullptr) == 0;
 }
 
-// Resolves remote.host and connects a UDP socket to the first address that takes one.
-// Runs on a worker. "" and the socket, or a code.
+// Resolves remote.host (a stop cancels the lookup: resolve.h) and connects a UDP socket to
+// the first address a socket can be created for. Runs on a worker. "" and the socket, or a
+// code. A UDP connect sends nothing, so there is nothing to stagger: an address that turns
+// out dead answers with ICMP, which ends the session (WSAECONNRESET).
 std::string OpenDirect(UdpShared& s, UniqueSocket* out) {
-    ADDRINFOW hints = {};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_protocol = IPPROTO_UDP;
-    ADDRINFOW* list = nullptr;
-    const std::wstring host = Utf8ToWide(s.rule.remoteHost);
-    const std::wstring port = std::to_wstring(s.rule.remotePort);
-    if (GetAddrInfoW(host.c_str(), port.c_str(), &hints, &list) != 0 || !list) return fwd_err::kResolveFailed;
-    std::unique_ptr<ADDRINFOW, decltype(&FreeAddrInfoW)> guard(list, &FreeAddrInfoW);
-    for (ADDRINFOW* ai = list; ai; ai = ai->ai_next) {
-        UniqueSocket c = NewUdpSocket(ai->ai_family);
+    std::vector<ResolvedAddr> addrs;
+    const std::string rc = ResolveHost(s.rule.remoteHost, s.rule.remotePort, SOCK_DGRAM, s.stopEvent, &addrs);
+    if (!rc.empty()) return rc;
+    for (const ResolvedAddr& a : addrs) {
+        UniqueSocket c = NewUdpSocket(a.family);
         if (!c) continue;
-        if (connect(c.get(), ai->ai_addr, static_cast<int>(ai->ai_addrlen)) != 0) continue;
+        if (connect(c.get(), reinterpret_cast<const sockaddr*>(&a.addr), a.len) != 0) continue;
         *out = std::move(c);
         return std::string();
     }
     return fwd_err::kConnectFailed;
+}
+
+std::atomic<int> g_listenFaults{0};
+std::atomic<int> g_listenFaultError{0};
+
+bool TakeListenFault(int* out) {
+    int cur = g_listenFaults.load();
+    while (cur > 0) {
+        if (g_listenFaults.compare_exchange_weak(cur, cur - 1)) {
+            *out = g_listenFaultError.load();
+            return true;
+        }
+    }
+    return false;
 }
 
 struct WorkerExit {
@@ -295,10 +310,7 @@ public:
             if (s_.stop.load()) return;
             if (fds[1].revents) DrainWake();
             TakeResults();
-            if (fds[0].revents && !DrainListener()) {
-                Fatal();
-                return;
-            }
+            if (fds[0].revents) DrainListener();
             for (size_t i = 2; i < fds.size(); ++i) {
                 if (!fds[i].revents) continue;
                 const uint64_t key = keys[i - 2];
@@ -393,23 +405,32 @@ private:
         return IoResult::Ok;
     }
 
-    // False on an error the listener cannot recover from.
-    bool DrainListener() {
+    void DrainListener() {
         for (int i = 0; i < kUdpBurst; ++i) {
             sockaddr_in from = {};
             int fromLen = sizeof(from);
-            const int k = recvfrom(listener_.get(), buf_.data(), static_cast<int>(buf_.size()), 0,
-                                   reinterpret_cast<sockaddr*>(&from), &fromLen);
+            int k = SOCKET_ERROR;
+            int fault = 0;
+            if (TakeListenFault(&fault)) {
+                WSASetLastError(fault);
+            } else {
+                k = recvfrom(listener_.get(), buf_.data(), static_cast<int>(buf_.size()), 0,
+                             reinterpret_cast<sockaddr*>(&from), &fromLen);
+            }
             if (k == SOCKET_ERROR) {
                 const int e = WSAGetLastError();
-                if (e == WSAEWOULDBLOCK) return true;
+                if (e == WSAEWOULDBLOCK) return;
                 if (e == WSAEMSGSIZE) {
                     Drop();
                     continue;
                 }
                 // Not expected with SIO_UDP_CONNRESET/NETRESET off, and harmless if it comes.
                 if (e == WSAECONNRESET || e == WSAENETRESET) continue;
-                return false;
+                // Anything else (out of buffers) would come straight back: the listener stays
+                // readable. Record it and give the system one slice instead of spinning on it.
+                s_.Fail(fwd_err::kInternal);
+                WaitForSingleObject(s_.stopEvent, kPollSliceMs);
+                return;
             }
             if (fromLen != static_cast<int>(sizeof(from)) || from.sin_family != AF_INET) {
                 Drop();
@@ -417,7 +438,6 @@ private:
             }
             FromClient(from, buf_.data(), static_cast<size_t>(k));
         }
-        return true;
     }
 
     void FromClient(const sockaddr_in& from, const char* data, size_t len) {
@@ -512,6 +532,7 @@ private:
         }
         se.remote = std::move(r.sock);
         se.open = true;
+        s_.stats.NoteSuccess();
         se.maxPayload = r.maxPayload;
         if (r.idleTimeoutMs > kUdpRelayIdleMarginMs) {
             se.idleMs = (std::min)(se.idleMs, static_cast<uint64_t>(r.idleTimeoutMs - kUdpRelayIdleMarginMs));
@@ -556,6 +577,15 @@ void PollMain(std::shared_ptr<UdpShared> sp, SOCKET listener) {
 }
 
 }  // namespace
+
+namespace testing {
+
+void InjectUdpListenErrors(int count, int wsaError) {
+    g_listenFaultError.store(wsaError);
+    g_listenFaults.store(count);
+}
+
+}  // namespace testing
 
 UdpForwarder::UdpForwarder(const Rule& rule, ForwardContext ctx)
     : s_(std::make_shared<UdpShared>(rule, std::move(ctx))) {}
@@ -637,6 +667,7 @@ void UdpForwarder::Start() {
 
 void UdpForwarder::SignalStop() {
     s_->stop.store(true);
+    if (s_->stopEvent) SetEvent(s_->stopEvent);
     {
         std::lock_guard<std::mutex> lock(s_->mu);
         if (s_->status == rule_status::kListening) s_->status = rule_status::kStopped;

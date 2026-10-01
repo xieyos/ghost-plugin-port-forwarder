@@ -28,6 +28,7 @@
 
 #include "clock.h"
 #include "json_util.h"
+#include "request_registry.h"
 #include "token_bucket.h"
 
 #include <windows.h>
@@ -141,15 +142,6 @@ private:
     // Shutdown()/Abort() closed the handle under it.
     bool SendOnce(const wchar_t* method, const std::string& path, const std::string* body, DWORD receiveTimeoutMs,
                   uintptr_t tag, int* status, std::string* response, bool* tooLarge, bool* aborted);
-    // The live-request registry. Every request handle is in live_ while its call runs. It is
-    // closed exactly once: by its owner if the owner removes it (Release returns true), or
-    // by Shutdown()/Abort(), which remove it first and then close it.
-    bool Register(HINTERNET req, uintptr_t tag);
-    bool Release(HINTERNET req);
-    // Whether `req` is still in live_ (nobody aborted it). Checked before every WinHTTP
-    // call after the first: once Shutdown()/Abort() closed the handle its value may be
-    // reused by a new request, and a call on it would act on someone else's request.
-    bool Owned(HINTERNET req);
     bool Refused(uintptr_t tag);
 
     Clock* clock_;
@@ -170,10 +162,12 @@ private:
     std::mutex rngMu_;
     uint64_t rngState_ = 0;
 
-    std::mutex liveMu_;
-    std::vector<std::pair<HINTERNET, uintptr_t>> live_;
-    std::vector<uintptr_t> abortedTags_;
-    bool closed_ = false;  // under liveMu_: Shutdown() has swept live_
+    // The live-request registry (request_registry.h). Every request handle is in it while its
+    // call runs, under the generation Register gave its owner. The owner checks Owned before
+    // every WinHTTP call after the first: once Shutdown()/Abort() closed the handle, its value
+    // may be reused by a new request, and a call on it would act on someone else's request --
+    // the generation is what tells the two apart.
+    RequestRegistry live_;
 };
 
 }  // namespace pf

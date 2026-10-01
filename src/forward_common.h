@@ -46,6 +46,11 @@ constexpr const char* kRemoteReset = "remote_reset";          // UDP: WSAECONNRE
 constexpr int kGlobalMaxConnections = 1024;
 constexpr DWORD kPollSliceMs = 250;
 
+// A LogFn must keep alive whatever it calls. A straggler thread (forward_tcp.h) copies only
+// the std::function and may run after the engine and its owner are gone, so a LogFn that
+// writes to an AppLog captures a shared_ptr<AppLog> -- never a raw pointer or a reference.
+// AppLog itself keeps a raw GhostApi* (applog.h): the same rule applies one level down,
+// whoever owns the AppLog keeps that GhostApi alive at least as long.
 using LogFn = std::function<void(LogLevel, const std::string&, const LogFields&)>;
 
 struct RuleStatus {

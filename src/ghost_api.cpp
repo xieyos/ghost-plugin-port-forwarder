@@ -58,76 +58,20 @@ GhostApi::~GhostApi() {
 }
 
 void GhostApi::Shutdown() {
-    std::vector<HINTERNET> doomed;
-    {
-        std::lock_guard<std::mutex> lock(liveMu_);
-        shutdown_ = true;
-        closed_ = true;  // from now on Register refuses, so nothing slips in after the sweep
-        for (const auto& e : live_) doomed.push_back(e.first);
-        live_.clear();
-    }
+    shutdown_ = true;
+    // From now on Register refuses, so nothing slips in after the sweep.
+    const std::vector<void*> doomed = live_.TakeAll();
     if (cancel_) SetEvent(cancel_);
-    // Closed outside the lock: the owner thread is inside a WinHTTP call on the handle, and
-    // closing it is what makes that call return.
-    for (HINTERNET h : doomed) WinHttpCloseHandle(h);
+    // Closed outside the registry's lock: the owner thread is inside a WinHTTP call on the
+    // handle, and closing it is what makes that call return.
+    for (void* h : doomed) WinHttpCloseHandle(static_cast<HINTERNET>(h));
 }
 
 void GhostApi::Abort(uintptr_t tag) {
-    if (tag == 0) return;
-    std::vector<HINTERNET> doomed;
-    {
-        std::lock_guard<std::mutex> lock(liveMu_);
-        abortedTags_.push_back(tag);
-        for (auto it = live_.begin(); it != live_.end();) {
-            if (it->second == tag) {
-                doomed.push_back(it->first);
-                it = live_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    for (HINTERNET h : doomed) WinHttpCloseHandle(h);
+    for (void* h : live_.TakeTag(tag)) WinHttpCloseHandle(static_cast<HINTERNET>(h));
 }
 
-bool GhostApi::Refused(uintptr_t tag) {
-    std::lock_guard<std::mutex> lock(liveMu_);
-    if (closed_) return true;
-    if (tag == 0) return false;
-    for (uintptr_t t : abortedTags_) {
-        if (t == tag) return true;
-    }
-    return false;
-}
-
-bool GhostApi::Register(HINTERNET req, uintptr_t tag) {
-    std::lock_guard<std::mutex> lock(liveMu_);
-    if (closed_) return false;
-    for (uintptr_t t : abortedTags_) {
-        if (tag != 0 && t == tag) return false;
-    }
-    live_.emplace_back(req, tag);
-    return true;
-}
-
-bool GhostApi::Owned(HINTERNET req) {
-    std::lock_guard<std::mutex> lock(liveMu_);
-    for (const auto& e : live_) {
-        if (e.first == req) return true;
-    }
-    return false;
-}
-
-bool GhostApi::Release(HINTERNET req) {
-    std::lock_guard<std::mutex> lock(liveMu_);
-    for (auto it = live_.begin(); it != live_.end(); ++it) {
-        if (it->first == req) {
-            live_.erase(it);
-            return true;
-        }
-    }
-    return false;  // Shutdown()/Abort() took it and closes it
-}
+bool GhostApi::Refused(uintptr_t tag) { return live_.Refused(tag); }
 
 double GhostApi::Random01() {
     if (random01_) return random01_();
@@ -256,7 +200,8 @@ bool GhostApi::SendOnce(const wchar_t* method, const std::string& path, const st
     HINTERNET req = WinHttpOpenRequest(connect_, method, wpath.c_str(), nullptr, WINHTTP_NO_REFERER,
                                        WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
     if (!req) return false;
-    if (!Register(req, tag)) {
+    const uint64_t gen = live_.Register(req, tag);
+    if (gen == 0) {
         WinHttpCloseHandle(req);
         *aborted = true;
         return false;
@@ -265,7 +210,7 @@ bool GhostApi::SendOnce(const wchar_t* method, const std::string& path, const st
     // answer read before an abort is still an answer -- it may carry a socket that only
     // adopting can close -- so `ok` is passed through.
     const auto finish = [&](bool ok) {
-        if (Release(req)) {
+        if (live_.Release(req, gen)) {
             WinHttpCloseHandle(req);
         } else {
             *aborted = true;
@@ -294,17 +239,17 @@ bool GhostApi::SendOnce(const wchar_t* method, const std::string& path, const st
     const DWORD bodyLen = body ? static_cast<DWORD>(body->size()) : 0;
     // From here on the handle may be aborted under us; each call is preceded by a check that
     // it is still ours (a call already blocked in WinHTTP is what the abort ends).
-    if (!Owned(req)) return finish(false);
+    if (!live_.Owned(req, gen)) return finish(false);
     ++sent_;
     if (!WinHttpSendRequest(req, headers.c_str(), static_cast<DWORD>(-1L),
                             body ? const_cast<char*>(body->data()) : WINHTTP_NO_REQUEST_DATA, bodyLen, bodyLen, 0)) {
         return finish(false);
     }
-    if (!Owned(req) || !WinHttpReceiveResponse(req, nullptr)) return finish(false);
+    if (!live_.Owned(req, gen) || !WinHttpReceiveResponse(req, nullptr)) return finish(false);
 
     DWORD code = 0;
     DWORD size = sizeof(code);
-    if (!Owned(req) ||
+    if (!live_.Owned(req, gen) ||
         !WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
                              &code, &size, WINHTTP_NO_HEADER_INDEX)) {
         return finish(false);
@@ -314,7 +259,7 @@ bool GhostApi::SendOnce(const wchar_t* method, const std::string& path, const st
     std::vector<char> buf(16 * 1024);
     for (;;) {
         DWORD got = 0;
-        if (!Owned(req) || !WinHttpReadData(req, buf.data(), static_cast<DWORD>(buf.size()), &got)) {
+        if (!live_.Owned(req, gen) || !WinHttpReadData(req, buf.data(), static_cast<DWORD>(buf.size()), &got)) {
             return finish(false);
         }
         if (got == 0) break;

@@ -16,13 +16,30 @@ Engine::Engine(EngineOptions opts)
 
 Engine::~Engine() { Stop(); }
 
-void Engine::StopForwarders(std::vector<std::unique_ptr<Forwarder>> forwarders, DWORD budgetMs) {
+void Engine::StopForwarders(std::vector<std::unique_ptr<Forwarder>> forwarders, uint64_t deadlineTick,
+                            bool interruptible) {
     // Every forwarder is told first, so that their connections close in parallel and one
     // budget covers them all.
     for (auto& f : forwarders) f->SignalStop();
-    const uint64_t deadline = GetTickCount64() + budgetMs;
     for (auto& f : forwarders) {
-        if (!f->WaitStopped(deadline)) retired_.push_back(std::move(f));
+        for (;;) {
+            if (interruptible && stopRequested_.load()) {
+                // Stop() waits for these within its own budget.
+                retired_.push_back(std::move(f));
+                break;
+            }
+            uint64_t until = deadlineTick;
+            if (interruptible) {
+                // Short slices, so that a Stop() requested meanwhile is noticed promptly.
+                const uint64_t slice = GetTickCount64() + kApplyWaitSliceMs;
+                if (slice < until) until = slice;
+            }
+            if (f->WaitStopped(until)) break;
+            if (GetTickCount64() >= deadlineTick) {
+                retired_.push_back(std::move(f));
+                break;
+            }
+        }
     }
 }
 
@@ -35,8 +52,9 @@ void Engine::PruneRetired() const {
 }
 
 void Engine::Apply(const std::vector<Rule>& rules) {
+    if (stopRequested_.load()) return;
     std::lock_guard<std::mutex> lock(mu_);
-    if (stopped_) return;
+    if (stopped_ || stopRequested_.load()) return;
 
     // 1. Keep the forwarders of unchanged rules; everything else that runs is stopped.
     std::vector<Entry> old;
@@ -55,7 +73,10 @@ void Engine::Apply(const std::vector<Rule>& rules) {
             continue;
         }
         for (Entry& o : old) {
-            if (o.fwd && o.rule.id == r.id && o.rule == r) {
+            // Kept only while it is listening: anything else (a failed bind, a via-node rule
+            // that was waiting for Ghost) gets a fresh start.
+            if (o.fwd && o.rule.id == r.id && o.rule == r &&
+                o.fwd->Snapshot().status == rule_status::kListening) {
                 e.fwd = std::move(o.fwd);
                 break;
             }
@@ -65,11 +86,17 @@ void Engine::Apply(const std::vector<Rule>& rules) {
     for (Entry& o : old) {
         if (o.fwd) toStop.push_back(std::move(o.fwd));
     }
-    StopForwarders(std::move(toStop), stopBudgetMs_);
+    StopForwarders(std::move(toStop), GetTickCount64() + stopBudgetMs_, /*interruptible=*/true);
 
-    // 2. Start what is new or changed.
+    // 2. Start what is new or changed -- unless Stop() was requested meanwhile: it is waiting
+    // for this lock, and whatever runs now it must stop again.
+    const bool stopping = stopRequested_.load();
     for (Entry& e : next) {
         if (e.fwd || !e.status.empty()) continue;
+        if (stopping) {
+            e.status = rule_status::kStopped;
+            continue;
+        }
         if (!e.rule.enabled) {
             e.status = rule_status::kDisabled;
             continue;
@@ -110,23 +137,30 @@ std::vector<RuleStatus> Engine::Snapshot() const {
 }
 
 void Engine::Stop() {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (stopped_) return;
-    stopped_ = true;
-    // Ends tunnel slot waits and plugin_not_running retries at once; a request already on
-    // the wire is not abandoned (see engine.h).
+    // The budget counts from here, not from when the lock is free.
+    const uint64_t deadline = GetTickCount64() + stopBudgetMs_;
+    stopRequested_.store(true);
+    // Before the lock: ends tunnel slot waits and plugin_not_running retries, and aborts the
+    // tunnel requests on the wire, so that the threads an Apply() holding the lock is waiting
+    // for return now. (TunnelClient::Shutdown may be called more than once.)
     if (ctx_.tunnel) {
         try {
             ctx_.tunnel->Shutdown();
         } catch (...) {
         }
     }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (stopped_) return;
+    stopped_ = true;
     std::vector<std::unique_ptr<Forwarder>> all;
     for (Entry& e : entries_) {
         if (e.fwd) all.push_back(std::move(e.fwd));
     }
     entries_.clear();
-    StopForwarders(std::move(all), stopBudgetMs_);
+    // Forwarders an earlier (or the interrupted) Apply() left behind are waited for too.
+    for (auto& f : retired_) all.push_back(std::move(f));
+    retired_.clear();
+    StopForwarders(std::move(all), deadline, /*interruptible=*/false);
     PruneRetired();
 }
 

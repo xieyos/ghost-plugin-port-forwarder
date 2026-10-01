@@ -26,6 +26,7 @@
 
 #include <mswsock.h>
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -635,6 +636,131 @@ void TestApplyRestartsOnlyChanged() {
     e.Stop();
 }
 
+
+// A receive error on the listener other than the ICMP kind (out of buffers) is recorded and
+// followed by a one-slice pause, not retried at once (the listener stays readable), and the
+// rule keeps listening: four injected failures delay the datagram by about four slices.
+void TestListenErrorsDoNotSpin() {
+    UdpEchoServer echo;
+    CHECK(echo.Start());
+    Engine e(EngineOptions{});
+    const int port = FreeUdpPort();
+    const std::string id = "r_000000000000007f";
+    e.Apply({MakeRule(id.c_str(), port, "127.0.0.1", echo.port())});
+    pf::testing::InjectUdpListenErrors(4, WSAENOBUFS);
+    UdpClient a;
+    const ULONGLONG t0 = GetTickCount64();
+    CHECK(a.RoundTrip(port, "after the errors"));
+    const ULONGLONG took = GetTickCount64() - t0;
+    pf::testing::InjectUdpListenErrors(0, 0);
+    std::printf("   forwarded after four errors in %llu ms\n", took);
+    CHECK_MSG(took >= 4 * pf::kPollSliceMs - 100, "each receive error is followed by a pause of one slice");
+    const auto s = Find(e, id);
+    CHECK_MSG(s.status == S::kListening, "a receive error does not end the rule");
+    CHECK(s.stats.lastError.code == pf::fwd_err::kInternal);
+    CHECK(s.stats.lastError.count == 4);
+    CHECK(a.RoundTrip(port, "and again"));
+    e.Stop();
+}
+
+// Re-applying an unchanged rule whose bind failed retries the bind.
+void TestReapplyRetriesBind() {
+    UdpEchoServer echo;
+    CHECK(echo.Start());
+    UniqueSocket holder(WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0, WSA_FLAG_NO_HANDLE_INHERIT));
+    sockaddr_in a = {};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int len = sizeof(a);
+    CHECK(bind(holder.get(), reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+    CHECK(getsockname(holder.get(), reinterpret_cast<sockaddr*>(&a), &len) == 0);
+    const int port = ntohs(a.sin_port);
+    Engine e(EngineOptions{});
+    const Rule r = MakeRule("r_0000000000000080", port, "127.0.0.1", echo.port());
+    e.Apply({r});
+    CHECK(Find(e, r.id).status == S::kBindFailed);
+    holder.Reset();
+    e.Apply({r});
+    CHECK_MSG(Find(e, r.id).status == S::kListening, "re-applying an unchanged bind_failed rule retries the bind");
+    UdpClient c;
+    CHECK(c.RoundTrip(port, "bound now"));
+    e.Stop();
+}
+
+// Every way a relay can fail drops the datagrams and never reaches the destination.
+void TestFailClosedRows() {
+    struct Row {
+        const char* name;
+        std::function<void(FakeGhost&)> setup;
+        std::string code;
+    };
+    const std::vector<Row> rows = {
+        {"answer dropped", [](FakeGhost& fg) { fg.SetTunnelDrop(true); }, pf::api_err::kGhostUnreachable},
+        {"malformed protocolInfo",
+         [](FakeGhost& fg) {
+             fg.SetTunnelFixedBody(R"({"status":"ok","proto":"udp","protocolInfo":"!!not base64!!",)"
+                                   R"("protocolInfoBytes":628,"node":{"id":"n1","name":"N","type":"socks5"},)"
+                                   R"("maxPayload":65000,"idleTimeoutMs":120000})");
+         },
+         pf::api_err::kBadResponse},
+    };
+    for (const Row& row : rows) {
+        UdpEchoServer dest;
+        CHECK(dest.Start());
+        GhostRig rig;
+        row.setup(rig.fg);
+        EngineOptions o;
+        o.tunnel = rig.source;
+        Engine e(o);
+        const int port = FreeUdpPort();
+        const std::string id = "r_0000000000000081";
+        e.Apply({MakeRule(id.c_str(), port, "127.0.0.1", dest.port(), EgressKind::Node, "n1")});
+        UdpClient c;
+        CHECK(c.Send(port, "x"));
+        CHECK_MSG(pf_test::WaitUntil(
+                      [&] {
+                          const auto s = Find(e, id).stats;
+                          return s.lastError.code == row.code && s.droppedDatagrams == 1 && s.udpSessions == 0;
+                      },
+                      5000),
+                  row.name);
+        CHECK(c.Silent(200));
+        CHECK_MSG(dest.Datagrams() == 0, row.name);
+        CHECK(rig.fg.CountPath(kTunnel) == 1);
+        e.Stop();
+    }
+}
+
+// lastError.count is the number of failures in a row: a session that opens ends the run.
+void TestSuccessEndsErrorRun() {
+    GhostRig rig;
+    rig.fg.QueueTunnelErrors({"upstream_unreachable", "upstream_unreachable"});
+    FakeClock clock;
+    EngineOptions o;
+    o.tunnel = rig.source;
+    o.clock = &clock;
+    Engine e(o);
+    const int port = FreeUdpPort();
+    const std::string id = "r_0000000000000082";
+    e.Apply({MakeRule(id.c_str(), port, "198.51.100.12", 53, EgressKind::Node, "n1")});
+    UdpClient a;
+    for (uint64_t i = 1; i <= 2; ++i) {
+        CHECK(a.Send(port, "fails"));
+        CHECK(pf_test::WaitUntil([&] { return Find(e, id).stats.lastError.count == i; }, 5000));
+        clock.Advance(pf::kUdpOpenFailureCacheMs);
+    }
+    CHECK(a.RoundTrip(port, "works"));
+    rig.fg.SetTunnelError("upstream_unreachable");
+    UdpClient b;
+    CHECK(b.Send(port, "fails again"));
+    CHECK(pf_test::WaitUntil([&] { return rig.fg.CountPath(kTunnel) == 4 && Find(e, id).stats.udpSessions == 1; },
+                             5000));
+    const auto st = Find(e, id).stats;
+    CHECK(st.lastError.code == "upstream_unreachable");
+    CHECK_MSG(st.lastError.count == 1, "a session that opened between failures starts a new run");
+    e.Stop();
+}
+
 }  // namespace
 
 int main() {
@@ -658,5 +784,9 @@ int main() {
     run("stop is bounded", TestStopIsBounded);
     run("stop leaves a straggler behind", TestStopLeavesStragglerBehind);
     run("apply restarts only the changed rule", TestApplyRestartsOnlyChanged);
+    run("listener errors do not spin", TestListenErrorsDoNotSpin);
+    run("re-apply retries a failed bind", TestReapplyRetriesBind);
+    run("fail closed rows", TestFailClosedRows);
+    run("a success ends the error run", TestSuccessEndsErrorRun);
     return pf_test::TestExitCode();
 }

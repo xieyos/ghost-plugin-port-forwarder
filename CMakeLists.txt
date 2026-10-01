@@ -72,6 +72,7 @@ add_library(pf_core STATIC
   src/ghost_api.cpp
   src/host_handshake.cpp
   src/local_addrs.cpp
+  src/resolve.cpp
   src/rule_store.cpp
   src/rules.cpp
   src/tunnel_client.cpp

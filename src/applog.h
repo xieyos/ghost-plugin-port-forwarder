@@ -63,7 +63,11 @@ using LogFields = std::vector<std::pair<std::string, std::string>>;
 std::string TruncateUtf8(const std::string& s, size_t maxBytes);
 
 struct AppLogOptions {
-    GhostApi* api = nullptr;    // null = standalone
+    // Null = standalone. Not owned: the GhostApi must outlive the AppLog -- and, since a
+    // forwarder's straggler thread may log through a LogFn that holds the AppLog by
+    // shared_ptr (forward_common.h), outlive every such thread too. Keep a shared_ptr to the
+    // GhostApi next to the AppLog (or inside the LogFn), never only a raw pointer.
+    GhostApi* api = nullptr;
     bool canWrite = false;      // log.write granted
     std::wstring localDir;      // where port-forwarder.log goes; "" = no local file
     Clock* clock = nullptr;     // null = DefaultClock()

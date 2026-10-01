@@ -5,8 +5,10 @@
 // Snapshot() from any thread. lastError is the one compound value and has its own lock.
 //
 // lastError.count is how many times IN A ROW the same code was recorded: a node that keeps
-// refusing shows "upstream_unreachable x 37", and a different code starts again at 1. It is
-// about the rule, never about a client: no address and no destination is kept here.
+// refusing shows "upstream_unreachable x 37"; a different code, or a connection that worked
+// in between (NoteSuccess), starts again at 1. The code itself stays visible after a success
+// -- it is the last error, not the current state. It is about the rule, never about a
+// client: no address and no destination is kept here.
 #pragma once
 
 #include <windows.h>
@@ -60,7 +62,8 @@ public:
     // repeats only bump the count.
     bool RecordError(const std::string& code) {
         std::lock_guard<std::mutex> lock(mu_);
-        const bool first = last_.code != code;
+        const bool first = last_.code != code || runEnded_;
+        runEnded_ = false;
         if (first) {
             last_.code = code;
             last_.count = 0;
@@ -68,6 +71,13 @@ public:
         ++last_.count;
         last_.atUnixMs = UnixMsNow();
         return first;
+    }
+
+    // A connection (TCP) or a session's remote end (UDP) was established: the next error
+    // starts a new run.
+    void NoteSuccess() {
+        std::lock_guard<std::mutex> lock(mu_);
+        runEnded_ = true;
     }
 
     StatsSnapshot Snapshot() const {
@@ -87,6 +97,7 @@ public:
 private:
     mutable std::mutex mu_;
     LastError last_;
+    bool runEnded_ = false;
 };
 
 }  // namespace pf

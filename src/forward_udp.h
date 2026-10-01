@@ -9,8 +9,9 @@
 //
 // The remote end of a session, opened on a short-lived worker thread so that the poll
 // thread never blocks (name resolution and a tunnel request both can):
-//   direct     remote.host is resolved here (GetAddrInfoW) and a UDP socket is connected
-//              to the first address a socket can be created for.
+//   direct     remote.host is resolved here (asynchronously, so a stop cancels the lookup:
+//              resolve.h) and a UDP socket is connected to the first address a socket can
+//              be created for.
 //   via a node Ghost relays the session through the user's upstream node and hands over
 //              one end of a connected loopback UDP pair (TunnelSource::Open, proto udp;
 //              spec-plugin-api.md section 10.4). One association per session.
@@ -43,7 +44,10 @@
 //
 // The listening socket: SO_EXCLUSIVEADDRUSE, not inheritable, and SIO_UDP_CONNRESET /
 // SIO_UDP_NETRESET off -- otherwise an ICMP error caused by a reply to a client that has
-// gone away would make the next receive on the listener fail, for every client.
+// gone away would make the next receive on the listener fail, for every client. Any other
+// receive error on it (out of buffers) is recorded as internal_error and the poll thread
+// waits one slice before it reads again: the listener stays readable, and retrying at once
+// would spin.
 //
 // Threads and stopping: as forward_tcp.h. The poll thread is joined; open workers are
 // detached and tracked, own what they use through a shared_ptr, and a worker that outlives
@@ -73,6 +77,12 @@ constexpr size_t kUdpQueueMaxBytes = 64 * 1024;
 constexpr uint32_t kUdpOpenFailureCacheMs = 10000;
 // Reclaim a relayed session this long before Ghost's own idle timeout would tear it down.
 constexpr uint32_t kUdpRelayIdleMarginMs = 1000;
+
+namespace testing {
+// Test seam: the next `count` receives on every UDP rule's listener fail with `wsaError`
+// without taking the datagram, as a real WSAENOBUFS would. 0 turns it off.
+void InjectUdpListenErrors(int count, int wsaError);
+}  // namespace testing
 
 struct UdpShared;  // forward_udp.cpp
 

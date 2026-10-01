@@ -54,6 +54,9 @@ pf_add_test(test_main_exe integration
 pf_add_test(test_api_policy unit
   SOURCES test_api_policy.cpp)
 
+pf_add_test(test_request_registry unit
+  SOURCES test_request_registry.cpp)
+
 pf_add_test(test_ghost_api functional
   SOURCES test_ghost_api.cpp
   LIBS pf_fake_ghost)

@@ -1,5 +1,6 @@
 #include "forward_tcp.h"
 
+#include "resolve.h"
 #include "util_str.h"
 
 #include <winsock2.h>
@@ -11,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace pf {
 
@@ -19,6 +21,9 @@ struct TcpShared {
     ForwardContext ctx;
     RuleStats stats;
     std::atomic<bool> stop{false};
+    // Signalled with `stop`: what a thread waits on instead of sleeping (an accept error's
+    // pause, a name lookup).
+    HANDLE stopEvent = nullptr;
     bool wsaOk = false;
 
     mutable std::mutex mu;
@@ -31,11 +36,13 @@ struct TcpShared {
 
     TcpShared(const Rule& r, ForwardContext c) : rule(r), ctx(std::move(c)) {
         if (!ctx.globalConnections) ctx.globalConnections = std::make_shared<std::atomic<int>>(0);
+        stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         // A Winsock reference of our own: a straggler thread may outlive every other user.
         WSADATA d;
         wsaOk = WSAStartup(MAKEWORD(2, 2), &d) == 0;
     }
     ~TcpShared() {
+        if (stopEvent) CloseHandle(stopEvent);
         if (wsaOk) WSACleanup();
     }
     TcpShared(const TcpShared&) = delete;
@@ -89,6 +96,18 @@ void SetNoDelay(SOCKET s) {
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
 }
 
+// Test seam (testing::InjectAcceptErrors): takes one injected fault, if any is left.
+bool TakeFault(std::atomic<int>& count, const std::atomic<int>& error, int* out) {
+    int cur = count.load();
+    while (cur > 0) {
+        if (count.compare_exchange_weak(cur, cur - 1)) {
+            *out = error.load();
+            return true;
+        }
+    }
+    return false;
+}
+
 // Takes one slot of the global limit, or fails when it is full.
 bool TryTakeGlobal(std::atomic<int>& g, int max) {
     int cur = g.load();
@@ -98,56 +117,81 @@ bool TryTakeGlobal(std::atomic<int>& g, int max) {
     return true;
 }
 
-// Resolves remote.host and tries each address with a kDirectConnectTimeoutMs timeout,
-// checking the stop flag every slice. "" and a connected, non-blocking socket, or a code.
-std::string ConnectDirect(TcpShared& s, UniqueSocket* out) {
-    ADDRINFOW hints = {};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    ADDRINFOW* list = nullptr;
-    const std::wstring host = Utf8ToWide(s.rule.remoteHost);
-    const std::wstring port = std::to_wstring(s.rule.remotePort);
-    if (GetAddrInfoW(host.c_str(), port.c_str(), &hints, &list) != 0 || !list) return fwd_err::kResolveFailed;
-    std::unique_ptr<ADDRINFOW, decltype(&FreeAddrInfoW)> guard(list, &FreeAddrInfoW);
+std::atomic<int> g_acceptFaults{0};
+std::atomic<int> g_acceptFaultError{0};
 
-    for (ADDRINFOW* ai = list; ai; ai = ai->ai_next) {
-        if (s.stop.load()) break;
-        UniqueSocket c(WSASocketW(ai->ai_family, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
-                                  WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT));
-        if (!c || !SetNonBlocking(c.get())) continue;
-        if (connect(c.get(), ai->ai_addr, static_cast<int>(ai->ai_addrlen)) != 0 &&
-            WSAGetLastError() != WSAEWOULDBLOCK) {
+// Connects to remote.host the RFC 8305 way. The name is resolved first (a stop cancels the
+// lookup, see resolve.h). Then one attempt per address, in the resolver's order: the next
+// one starts kStaggerDelayMs after the previous, or at once when the previous failed, and
+// earlier attempts keep running -- the first to connect wins and the others are closed.
+// kDirectConnectTimeoutMs covers the whole set. Without the stagger a dead first address
+// costs the whole budget: "localhost" is ::1 first on most machines, and Windows retries a
+// refused loopback connect for about 2 s. "" and a connected, non-blocking socket, or a code.
+std::string ConnectDirect(TcpShared& s, UniqueSocket* out) {
+    std::vector<ResolvedAddr> addrs;
+    const std::string rc = ResolveHost(s.rule.remoteHost, s.rule.remotePort, SOCK_STREAM, s.stopEvent, &addrs);
+    if (!rc.empty()) return rc;
+
+    std::vector<UniqueSocket> pending;
+    size_t next = 0;
+    const uint64_t deadline = GetTickCount64() + kDirectConnectTimeoutMs;
+    uint64_t nextStartAt = 0;  // the first attempt starts at once
+    while (!s.stop.load()) {
+        const uint64_t now = GetTickCount64();
+        if (now >= deadline) break;
+        if (next < addrs.size() && now >= nextStartAt && pending.size() < FD_SETSIZE) {
+            const ResolvedAddr& a = addrs[next++];
+            UniqueSocket c(WSASocketW(a.family, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
+                                      WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT));
+            if (c && SetNonBlocking(c.get())) {
+                if (connect(c.get(), reinterpret_cast<const sockaddr*>(&a.addr), a.len) == 0) {
+                    *out = std::move(c);
+                    return std::string();
+                }
+                if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                    pending.push_back(std::move(c));
+                    nextStartAt = now + kStaggerDelayMs;
+                    continue;
+                }
+            }
+            nextStartAt = now;  // this address failed at once: the next one now
             continue;
         }
-        const uint64_t deadline = GetTickCount64() + kDirectConnectTimeoutMs;
-        bool connected = false;
-        while (!s.stop.load()) {
-            const uint64_t now = GetTickCount64();
-            if (now >= deadline) break;
-            const uint64_t left = deadline - now;
-            const DWORD slice = static_cast<DWORD>(left < kPollSliceMs ? left : kPollSliceMs);
-            fd_set w;
-            fd_set e;
-            FD_ZERO(&w);
-            FD_ZERO(&e);
-            FD_SET(c.get(), &w);
-            FD_SET(c.get(), &e);
-            timeval tv = {0, static_cast<long>(slice) * 1000};
-            const int n = select(0, nullptr, &w, &e, &tv);
-            if (n == SOCKET_ERROR) break;
-            if (n == 0) continue;
+        if (pending.empty()) {
+            if (next >= addrs.size()) break;  // every address failed
+            continue;
+        }
+        uint64_t until = deadline;
+        if (next < addrs.size() && nextStartAt < until) until = nextStartAt;
+        uint64_t waitMs = until > now ? until - now : 0;
+        if (waitMs > kPollSliceMs) waitMs = kPollSliceMs;
+        fd_set w;
+        fd_set e;
+        FD_ZERO(&w);
+        FD_ZERO(&e);
+        for (const UniqueSocket& p : pending) {
+            FD_SET(p.get(), &w);
+            FD_SET(p.get(), &e);
+        }
+        timeval tv = {0, static_cast<long>(waitMs) * 1000};
+        const int n = select(0, nullptr, &w, &e, &tv);
+        if (n == SOCKET_ERROR) break;
+        for (size_t i = 0; n > 0 && i < pending.size();) {
+            const SOCKET ps = pending[i].get();
+            const bool writable = FD_ISSET(ps, &w) != 0;
+            if (!writable && !FD_ISSET(ps, &e)) {
+                ++i;
+                continue;
+            }
             int err = 0;
             int len = sizeof(err);
-            if (FD_ISSET(c.get(), &w) &&
-                getsockopt(c.get(), SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len) == 0 && err == 0) {
-                connected = true;
+            if (writable && getsockopt(ps, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len) == 0 &&
+                err == 0) {
+                *out = std::move(pending[i]);
+                return std::string();  // the other attempts close with `pending`
             }
-            break;
-        }
-        if (connected) {
-            *out = std::move(c);
-            return std::string();
+            pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(i));
+            nextStartAt = 0;  // a failed attempt starts the next one at once
         }
     }
     return fwd_err::kConnectFailed;
@@ -202,6 +246,19 @@ bool PumpWrite(Direction& d) {
     return true;
 }
 
+// One side of the connection failed. Best effort, within one slice: hand the healthy side
+// (d.dst) what is still buffered for it, then shutdown(SD_SEND), so it reads that data and
+// an EOF instead of losing the data to the close.
+void FlushToHealthy(TcpShared& s, Direction& d) {
+    if (d.shut) return;
+    size_t sent = 0;
+    const bool all = detail::FlushThenShutdown(d.dst, d.buf.get() + d.off, d.len - d.off, kPollSliceMs, &s.stop,
+                                               &sent);
+    *d.counter += sent;
+    d.off += sent;
+    if (all) d.shut = true;
+}
+
 // Moves bytes both ways until both directions ended (graceful), an error, or a stop.
 void Pump(TcpShared& s, SOCKET client, SOCKET remote) {
     if (!SetNonBlocking(client) || !SetNonBlocking(remote)) {
@@ -239,10 +296,17 @@ void Pump(TcpShared& s, SOCKET client, SOCKET remote) {
         const int n = select(0, r.fd_count ? &r : nullptr, w.fd_count ? &w : nullptr, nullptr, &tv);
         if (n == SOCKET_ERROR) return;
         for (Direction* d : dirs) {
-            if (FD_ISSET(d->src, &r) && !PumpRead(*d)) return;
+            Direction* other = d == &up ? &down : &up;
+            if (FD_ISSET(d->src, &r) && !PumpRead(*d)) {
+                FlushToHealthy(s, *d);  // d->src failed; d->dst is the healthy side
+                return;
+            }
             // Written straight after reading (usually possible at once), or when the
             // destination became writable again.
-            if (!PumpWrite(*d)) return;
+            if (!PumpWrite(*d)) {
+                FlushToHealthy(s, *other);  // d->dst failed; other->dst (== d->src) is healthy
+                return;
+            }
         }
     }
 }
@@ -283,6 +347,7 @@ void ConnectionMain(std::shared_ptr<TcpShared> sp, SOCKET clientSock) {
             return;
         }
         if (s.stop.load()) return;
+        s.stats.NoteSuccess();
         Pump(s, client.get(), remote.get());
     } catch (...) {
         if (!s.stop.load()) s.Fail(fwd_err::kInternal);
@@ -311,8 +376,25 @@ void AcceptLoop(std::shared_ptr<TcpShared> sp, SOCKET listenSock) {
             return;
         }
         if (n == 0) continue;
-        UniqueSocket c(accept(listener.get(), nullptr, nullptr));
-        if (!c) continue;  // WSAEWOULDBLOCK, or a connection reset before we took it
+        SOCKET accepted = INVALID_SOCKET;
+        int fault = 0;
+        if (TakeFault(g_acceptFaults, g_acceptFaultError, &fault)) {
+            WSASetLastError(fault);
+        } else {
+            accepted = accept(listener.get(), nullptr, nullptr);
+        }
+        UniqueSocket c(accepted);
+        if (!c) {
+            const int e = WSAGetLastError();
+            // Nothing to take after all, or a connection reset before we took it.
+            if (e == WSAEWOULDBLOCK || e == WSAECONNRESET) continue;
+            // Anything else (out of buffers, out of handles) would come straight back: the
+            // listener stays readable. Record it and give the system one slice instead of
+            // spinning on it.
+            s.Fail(fwd_err::kInternal);
+            WaitForSingleObject(s.stopEvent, kPollSliceMs);
+            continue;
+        }
         SetNoInherit(c.get());
         if (s.stop.load()) break;
 
@@ -354,6 +436,46 @@ void AcceptLoop(std::shared_ptr<TcpShared> sp, SOCKET listenSock) {
 }
 
 }  // namespace
+
+namespace detail {
+
+bool FlushThenShutdown(SOCKET dst, const char* data, size_t len, DWORD budgetMs, const std::atomic<bool>* stop,
+                       size_t* sent) {
+    *sent = 0;
+    const uint64_t deadline = GetTickCount64() + budgetMs;
+    while (*sent < len) {
+        if (stop && stop->load()) return false;
+        const uint64_t now = GetTickCount64();
+        if (now >= deadline) return false;
+        fd_set w;
+        FD_ZERO(&w);
+        FD_SET(dst, &w);
+        timeval tv = {0, static_cast<long>(deadline - now) * 1000};
+        const int ready = select(0, nullptr, &w, nullptr, &tv);
+        if (ready == SOCKET_ERROR) return false;
+        if (ready == 0) continue;
+        const int n = send(dst, data + *sent, static_cast<int>(len - *sent), 0);
+        if (n > 0) {
+            *sent += static_cast<size_t>(n);
+            continue;
+        }
+        if (n == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) continue;
+        return false;
+    }
+    // Everything arrived: only now may the other side be told that nothing more is coming.
+    return shutdown(dst, SD_SEND) == 0;
+}
+
+}  // namespace detail
+
+namespace testing {
+
+void InjectAcceptErrors(int count, int wsaError) {
+    g_acceptFaultError.store(wsaError);
+    g_acceptFaults.store(count);
+}
+
+}  // namespace testing
 
 std::string BindFailureDetail(int wsaError, Proto proto) {
     std::string d = "WSA error " + std::to_string(wsaError);
@@ -455,6 +577,7 @@ void TcpForwarder::Start() {
 
 void TcpForwarder::SignalStop() {
     s_->stop.store(true);
+    if (s_->stopEvent) SetEvent(s_->stopEvent);
     std::lock_guard<std::mutex> lock(s_->mu);
     if (s_->status == rule_status::kListening) s_->status = rule_status::kStopped;
 }
