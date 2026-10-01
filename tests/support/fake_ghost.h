@@ -96,6 +96,9 @@ public:
     // Nothing else is done -- no tunnel is opened. Status 0 turns it off.
     void SetFixedAnswer(int status, std::vector<std::pair<std::string, std::string>> headers, std::string body);
     void SetListDelayMs(DWORD ms);         // wait before answering upstream.list
+    // Wait before answering log.write (a stalled Ghost); the wait ends early, unanswered, when
+    // the client closes the connection (counted in LogIngestAbandoned).
+    void SetLogIngestDelayMs(DWORD ms);
 
     // ---- Observation ----
     std::vector<FakeRequest> Requests() const;
@@ -107,6 +110,8 @@ public:
     // Tunnel requests whose client closed the connection while the answer was delayed or
     // gated (what an aborted request looks like from here). Those are not answered.
     int ClientClosedDuringDelay() const { return closedDuringDelay_.load(); }
+    // log.write requests whose client gave up while the answer was delayed.
+    int LogIngestAbandoned() const { return logAbandoned_.load(); }
     // One line for a failure message: request counts by route, tunnels in progress, echoes.
     std::string Describe() const;
     // Closes every UDP relay end this fake holds (the plugin's next recv then fails).
@@ -159,10 +164,12 @@ private:
     std::vector<std::pair<std::string, std::string>> fixedHeaders_;
     std::string fixedBody_;
     DWORD listDelayMs_ = 0;
+    DWORD logDelayMs_ = 0;
 
     std::atomic<int> tunnelsInProgress_{0};
     std::atomic<int> udpEchoed_{0};
     std::atomic<int> closedDuringDelay_{0};
+    std::atomic<int> logAbandoned_{0};
 };
 
 // Standard base64 with padding (the fake's own encoder, independent of the plugin's

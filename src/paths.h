@@ -20,10 +20,21 @@ std::wstring FullPath(const std::wstring& dir);
 // afterwards; otherwise `error` says why.
 bool EnsureDirectory(const std::wstring& dir, std::string* error);
 
+// Two full paths (FullPath) name the same directory as far as their text can tell:
+// ordinal, case-insensitive (CompareStringOrdinal). Not a file-system identity check -- an
+// 8.3 name, a junction or a mapped drive spelling the same directory differently is "not the
+// same"; for the single-instance lock that costs a second instance, not a broken one.
+bool SamePath(const std::wstring& a, const std::wstring& b);
+
 // The standalone single-instance mutex: Local\com.qtvz.xieyos.port-forwarder.standalone for
 // the default data directory; for another one (--data-dir) the same name with "." and 16
 // hex digits of a hash of its lower-cased full path -- one instance per rules file, so a
-// test's instance in a temporary directory never collides with the user's own.
+// test's instance in a temporary directory never collides with the user's own. The "Local\"
+// namespace makes it one instance per data directory per logon session; another user (or the same user
+// in another session, e.g. over RDP) can run its own -- with its own %LOCALAPPDATA%, so its
+// own rules file, unless --data-dir points both at one directory. Pointing --data-dir at a
+// hosted plugin's .data directory is not refused either: two processes then share a rules
+// file (writes stay atomic; each sees the other's changes only on its next start).
 std::wstring StandaloneMutexName(const std::wstring& dataDir, bool isDefaultDir);
 
 }  // namespace pf

@@ -58,6 +58,13 @@ bool EnsureDirectory(const std::wstring& dir, std::string* error) {
     return true;
 }
 
+bool SamePath(const std::wstring& a, const std::wstring& b) {
+    if (a.empty() || b.empty()) return false;
+    if (a.size() > static_cast<size_t>(INT_MAX) || b.size() > static_cast<size_t>(INT_MAX)) return false;
+    return CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()),
+                                TRUE) == CSTR_EQUAL;
+}
+
 std::wstring StandaloneMutexName(const std::wstring& dataDir, bool isDefaultDir) {
     std::wstring name = L"Local\\" + Utf8ToWide(PF_PLUGIN_ID) + L".standalone";
     if (isDefaultDir) return name;

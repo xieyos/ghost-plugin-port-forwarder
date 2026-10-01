@@ -137,14 +137,16 @@ bool SendAll(SOCKET s, const std::string& data, uint64_t deadline, const std::at
 // client still sends (an unread body: a 413, a 404 before the body) is read and dropped
 // until its FIN, a bounded time and amount -- closing a socket with unread data resets the
 // connection, and a reset can make the client lose the response it was about to read.
-void LingeringClose(SOCKET s) {
+//
+// The wait ends early once `stop` is set: the process is exiting, and a lost answer then
+// costs nothing. `budgetMs` and the byte cap bound it otherwise.
+void LingeringClose(SOCKET s, DWORD budgetMs, const std::atomic<bool>& stop) {
     shutdown(s, SD_SEND);
-    const uint64_t deadline = GetTickCount64() + 1000;
-    std::atomic<bool> never{false};
+    const uint64_t deadline = GetTickCount64() + budgetMs;
     size_t drained = 0;
     char buf[4096];
     while (drained < 256 * 1024) {
-        if (WaitFor(s, POLLRDNORM, deadline, never) != 1) break;
+        if (WaitFor(s, POLLRDNORM, deadline, stop) != 1) break;
         const int n = recv(s, buf, sizeof(buf), 0);
         if (n > 0) {
             drained += static_cast<size_t>(n);
@@ -349,15 +351,23 @@ ReadOutcome ServeOne(Shared& sh, SOCKET c) {
 }
 
 void ServeConnection(std::shared_ptr<Shared> sh, SOCKET c) {
+    bool answered = false;
     try {
         const ReadOutcome o = ServeOne(*sh, c);
         if (o.respond) {
-            SendAll(c, FormatResponse(sh->csp, o.response), GetTickCount64() + sh->opts.sendTimeoutMs, sh->stop);
+            answered =
+                SendAll(c, FormatResponse(sh->csp, o.response), GetTickCount64() + sh->opts.sendTimeoutMs, sh->stop);
         }
     } catch (...) {
     }
     try {
-        LingeringClose(c);
+        // Lingering only protects an answer that was sent; with none (the client went away,
+        // the server is stopping) there is nothing to protect.
+        if (answered && !sh->stop.load()) {
+            LingeringClose(c, kUiLingerMs, sh->stop);
+        } else {
+            closesocket(c);
+        }
     } catch (...) {
         closesocket(c);
     }
@@ -398,14 +408,11 @@ void AcceptLoop(std::shared_ptr<Shared> sh) {
                 // loses it, which is all a 17th connection is owed.
                 const std::string busy = FormatResponse(sh->csp, Error(503, ui_err::kBusy));
                 send(c, busy.data(), static_cast<int>(busy.size()), 0);
-                shutdown(c, SD_SEND);
-                // Whatever of the request has already arrived is read and dropped (never
-                // waited for): closing with unread data would reset the connection and the
-                // client could lose the answer.
-                char sink[4096];
-                for (int i = 0; i < 16 && recv(c, sink, sizeof(sink), 0) > 0; ++i) {
-                }
-                closesocket(c);
+                // A short linger (kUiBusyLingerMs, on this thread: this is the overload path,
+                // and accepting more slowly is what it should do): the request that is still
+                // arriving is read and dropped, so that closing does not reset the connection
+                // and lose the 503.
+                LingeringClose(c, kUiBusyLingerMs, sh->stop);
                 continue;
             }
             try {
@@ -436,7 +443,8 @@ bool IsLoopbackOrigin(const std::string& s) {
 
 std::string UiCsp(const std::string& frameAncestor) {
     const std::string ancestor = IsLoopbackOrigin(frameAncestor) ? frameAncestor : std::string("'none'");
-    return "default-src 'self'; img-src 'self' data:; frame-ancestors " + ancestor;
+    return "default-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors " +
+           ancestor;
 }
 
 bool IsJsonContentType(const std::string& value) {
@@ -529,6 +537,10 @@ bool UiServer::Start(std::string* error) {
 }
 
 void UiServer::Stop() {
+    // Idempotent: the destructor calls Stop() again, and a second wait would come after the
+    // owner's exit deadline was planned around the first.
+    if (stopCalled_) return;
+    stopCalled_ = true;
     sh_->stop.store(true);
     if (accept_.joinable()) accept_.join();
     if (sh_->listener != INVALID_SOCKET) {

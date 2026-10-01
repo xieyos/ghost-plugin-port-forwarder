@@ -50,9 +50,16 @@ constexpr DWORD kKillAtMs = 2850;
 // Windows ends the process when the handler returns and grants about 5 s.
 constexpr DWORD kConsoleCloseWaitMs = 4000;
 
+// The deadline is declared FIRST in RunHosted/RunStandalone and armed when the shutdown begins, so it
+// is destroyed LAST: it also covers the destructors of everything declared after it (the
+// page server's, the log's), not only the explicit shutdown calls.
 class ExitDeadline {
 public:
-    explicit ExitDeadline(std::shared_ptr<pf::GhostApi> api) : api_(std::move(api)) {
+    ExitDeadline() = default;
+    // Starts the clock. Once only.
+    void Arm(std::shared_ptr<pf::GhostApi> api) {
+        if (done_) return;
+        api_ = std::move(api);
         done_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!done_) return;
         try {
@@ -114,7 +121,8 @@ pf::LogFn MakeLogFn(const std::shared_ptr<pf::AppLog>& log, const std::shared_pt
     };
 }
 
-// The page address is never logged: its prefix is what keeps other local programs out.
+// The page address is never logged: its prefix is what keeps web pages out (a log is read
+// by more people than this machine's user).
 void LogStartup(const pf::LogFn& log, const pf::LoadResult& r, bool hosted) {
     const std::string mode = hosted ? "hosted" : "standalone";
     log(pf::LogLevel::Info,
@@ -141,8 +149,9 @@ void LogStartup(const pf::LogFn& log, const pf::LoadResult& r, bool hosted) {
     }
 }
 
-void ShutDown(pf::App& app, pf::UiServer& ui, pf::AppLog& log, const std::shared_ptr<pf::GhostApi>& api) {
-    ExitDeadline deadline(api);
+void ShutDown(ExitDeadline& deadline, pf::App& app, pf::UiServer& ui, pf::AppLog& log,
+              const std::shared_ptr<pf::GhostApi>& api) {
+    deadline.Arm(api);
     log.Write(pf::LogLevel::Info, "Port Forwarder stopping");
     app.Stop();  // listeners and connections, within the engine's 2 s
     ui.Stop();
@@ -151,6 +160,7 @@ void ShutDown(pf::App& app, pf::UiServer& ui, pf::AppLog& log, const std::shared
 }
 
 int RunHosted() {
+    ExitDeadline deadline;  // first: destroyed last (see the class)
     const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
 
@@ -214,7 +224,7 @@ int RunHosted() {
     app->StartEngine();
 
     stop.WaitForever();
-    ShutDown(*app, ui, *log, api);
+    ShutDown(deadline, *app, ui, *log, api);
     return 0;
 }
 
@@ -245,6 +255,7 @@ StandaloneArgs ParseArgs(int argc, wchar_t** argv) {
 }
 
 int RunStandalone(int argc, wchar_t** argv) {
+    ExitDeadline deadline;  // first: destroyed last (see the class)
     const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
     const StandaloneArgs args = ParseArgs(argc, argv);
     if (!args.error.empty()) {
@@ -252,8 +263,11 @@ int RunStandalone(int argc, wchar_t** argv) {
                                "\nusage: port-forwarder [--data-dir <dir>] [--no-browser]\n");
         return 2;
     }
-    const bool isDefault = args.dataDir.empty();
-    const std::wstring dataDir = isDefault ? pf::DefaultStandaloneDataDir() : pf::FullPath(args.dataDir);
+    const std::wstring defaultDir = pf::DefaultStandaloneDataDir();
+    const std::wstring dataDir = args.dataDir.empty() ? defaultDir : pf::FullPath(args.dataDir);
+    // --data-dir naming the default directory (in any spelling of case) is the default
+    // directory: same rules file, same lock.
+    const bool isDefault = pf::SamePath(dataDir, defaultDir);
     std::string dirErr;
     if (dataDir.empty() || !pf::EnsureDirectory(dataDir, &dirErr)) {
         pf::WriteLine(out, "port-forwarder: cannot use the data directory " + pf::WideToUtf8(dataDir) + ": " +
@@ -295,7 +309,7 @@ int RunStandalone(int argc, wchar_t** argv) {
     std::string uiErr;
     if (!ui.Start(&uiErr)) {
         pf::WriteLine(out, "port-forwarder: the management page could not start: " + uiErr + "\n");
-        ShutDown(*app, ui, *log, nullptr);
+        ShutDown(deadline, *app, ui, *log, nullptr);
         SetEvent(g_shutdownDone);
         CloseHandle(mutex);
         return 1;
@@ -318,7 +332,7 @@ int RunStandalone(int argc, wchar_t** argv) {
     }
 
     WaitForSingleObject(g_quit, INFINITE);
-    ShutDown(*app, ui, *log, nullptr);
+    ShutDown(deadline, *app, ui, *log, nullptr);
     SetEvent(g_shutdownDone);
     CloseHandle(mutex);
     return 0;

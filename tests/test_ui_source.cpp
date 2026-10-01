@@ -70,6 +70,51 @@ void AppJsWritesOnlyText(const std::string& js) {
     CHECK(js.find("fetch(path") != std::string::npos);
 }
 
+// The body of `function <name>(` up to its matching closing brace ("" if not found).
+std::string FunctionBody(const std::string& js, const std::string& name) {
+    const size_t at = js.find("function " + name + "(");
+    if (at == std::string::npos) return std::string();
+    const size_t open = js.find('{', at);
+    if (open == std::string::npos) return std::string();
+    int depth = 0;
+    for (size_t i = open; i < js.size(); ++i) {
+        if (js[i] == '{') ++depth;
+        if (js[i] == '}' && --depth == 0) return js.substr(open, i - open + 1);
+    }
+    return std::string();
+}
+
+size_t Count(const std::string& s, const std::string& what) {
+    size_t n = 0;
+    for (size_t at = s.find(what); at != std::string::npos; at = s.find(what, at + 1)) ++n;
+    return n;
+}
+
+// The row buttons are rebuilt only when their own key changes; a button that closed over the
+// rule object of its last rebuild would open the editor on a stale copy, and saving it would
+// silently revert whatever changed since. So: the editor is opened with null (a new rule) or
+// with the rule looked up by id at click time, and the row's buttons hold only the id.
+void EditorOpensTheCurrentRule(const std::string& js) {
+    CHECK_EQ(Count(js, "openEditor("), static_cast<size_t>(3));  // the definition and two calls
+    CHECK(js.find("openEditor(null)") != std::string::npos);
+    const std::string edit = FunctionBody(js, "editRule");
+    const size_t lookup = edit.find("= currentRule(id)");
+    CHECK_MSG(lookup != std::string::npos, "editRule looks the rule up by id");
+    CHECK_MSG(edit.find("openEditor(cur)") != std::string::npos && edit.find("openEditor(cur)") > lookup,
+              "editRule opens the looked-up rule");
+    const std::string toggle = FunctionBody(js, "toggleRule");
+    CHECK_MSG(toggle.find("= currentRule(id)") != std::string::npos, "toggleRule reads enabled at click time");
+    const std::string current = FunctionBody(js, "currentRule");
+    CHECK_MSG(current.find("state.rules") != std::string::npos, "currentRule reads the latest state");
+    const std::string actions = FunctionBody(js, "renderActions");
+    CHECK(actions.find("editRule(id)") != std::string::npos);
+    CHECK(actions.find("toggleRule(id)") != std::string::npos);
+    CHECK_MSG(actions.find("openEditor") == std::string::npos, "no row button opens the editor directly");
+    // Inside the click handlers nothing is read from the row's rule object.
+    const std::regex handler(R"(function \(\) \{[^}]*\br\.)");
+    CHECK_MSG(!std::regex_search(actions, handler), "a row button's handler reads the stale rule object");
+}
+
 void IndexHtmlHasNoInlineCode(const std::string& html) {
     CHECK_MSG(html.size() > 500, "index.html was read");
     const std::regex inlineScript(R"(<script(?![^>]*\bsrc=)[^>]*>)", std::regex::icase);
@@ -145,5 +190,6 @@ int wmain(int argc, wchar_t** argv) {
     IndexHtmlHasNoInlineCode(ReadAll(g_ui + L"\\index.html"));
     CssHasNoUrls(ReadAll(g_ui + L"\\app.css"));
     EveryCodeHasText(js);
+    EditorOpensTheCurrentRule(js);
     return pf_test::TestExitCode();
 }

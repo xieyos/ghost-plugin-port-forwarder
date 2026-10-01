@@ -2,12 +2,15 @@
 // connection.
 //
 // Ghost shows the page in an iframe named ghost-plugin-<port> (spec-manifest.md section 5),
-// a different origin from Ghost; standalone, the user's browser shows it. Either way any
-// other local process can connect to the port, and any web page the user visits can make
-// the browser send requests to it. What keeps them out:
+// a different origin from Ghost; standalone, the user's browser shows it. Any web page the
+// user visits can make the browser send requests to the port. What keeps those out:
 //
 //   * A random 128-bit path prefix (BCryptGenRandom -> 32 lower-case hex digits). Every
 //     route is under /<prefix>/; anything else is 404. uiUrl = http://127.0.0.1:<p>/<prefix>/.
+//     A web page cannot learn it. It does NOT keep out local programs: one running as the
+//     same user can read it out of this process (or out of Ghost, or the console standalone)
+//     and then make any request the page can. Nothing here defends against that; the same
+//     user could edit rules.json directly anyway.
 //   * Host must be exactly "127.0.0.1:<p>" (400 otherwise): a DNS-rebinding page reaches
 //     the port under its own host name and is refused before anything is looked at.
 //   * A POST must carry exactly one Origin, equal to "http://127.0.0.1:<p>", and
@@ -23,6 +26,10 @@
 // closed), and the whole request must arrive within 10 s (408) -- a slow client cannot pin
 // a thread forever. Every response says Connection: close. Every read and write waits in
 // slices of kUiPollSliceMs and looks at the stop flag after each.
+//
+// A connection that was answered is closed after a short linger (kUiLingerMs) that reads and
+// drops what the client still sends, so the answer is not lost to a reset; one that got no
+// answer, or any once the server is stopping, is closed at once.
 //
 // Responses always carry: Content-Security-Policy (UiCsp), X-Content-Type-Options: nosniff,
 // Referrer-Policy: no-referrer, Cache-Control: no-store.
@@ -54,6 +61,8 @@ constexpr DWORD kUiRequestTimeoutMs = 10000;  // the whole request, headers and 
 constexpr DWORD kUiSendTimeoutMs = 10000;     // the whole response
 constexpr DWORD kUiStopWaitMs = 500;
 constexpr DWORD kUiPollSliceMs = 100;
+constexpr DWORD kUiLingerMs = 1000;      // after an answer; cut short by Stop()
+constexpr DWORD kUiBusyLingerMs = 200;   // after a 503 busy, on the accept thread
 // spec-limits.md: uiUrl is at most 2048 bytes.
 constexpr size_t kMaxUiUrlBytes = 2048;
 // Ghost's own control interface; a uiUrl on it (or on 80, which a browser drops from the
@@ -104,7 +113,9 @@ struct UiServerOptions {
     DWORD stopWaitMs = kUiStopWaitMs;
 };
 
-// "default-src 'self'; img-src 'self' data:; frame-ancestors <ancestor or 'none'>".
+// "default-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none';
+//  frame-ancestors <ancestor or 'none'>" -- the page submits nothing natively (its form is
+// handled by script) and sets no <base>.
 std::string UiCsp(const std::string& frameAncestor);
 
 // The receipt's rule for uiUrl (spec-host-protocol.md 3.2, spec-manifest.md 5, spec-limits.md):
@@ -126,6 +137,8 @@ public:
     // starts the accept thread. False with a short reason in `error`.
     bool Start(std::string* error);
     // Stops accepting, tells every connection to end, waits at most stopWaitMs for them.
+    // Idempotent: a second call (the destructor's) returns at once. Not thread-safe against
+    // itself; the owner calls it from one thread.
     void Stop();
 
     uint16_t port() const;
@@ -141,6 +154,7 @@ private:
     std::shared_ptr<Shared> sh_;
     std::thread accept_;
     bool started_ = false;
+    bool stopCalled_ = false;
 };
 
 }  // namespace pf

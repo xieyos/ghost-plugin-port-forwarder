@@ -263,6 +263,10 @@ void FakeGhost::SetListDelayMs(DWORD ms) {
     std::lock_guard<std::mutex> lock(mu_);
     listDelayMs_ = ms;
 }
+void FakeGhost::SetLogIngestDelayMs(DWORD ms) {
+    std::lock_guard<std::mutex> lock(mu_);
+    logDelayMs_ = ms;
+}
 
 std::vector<FakeRequest> FakeGhost::Requests() const {
     std::lock_guard<std::mutex> lock(mu_);
@@ -431,6 +435,23 @@ FakeGhost::Answer FakeGhost::Handle(const FakeRequest& req) {
     }
     if (req.method == "POST" && req.path == "/api/upstream/tunnel") return HandleTunnel(req);
     if (req.method == "POST" && req.path == "/api/log-ingest") {
+        DWORD logDelay = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            logDelay = logDelayMs_;
+        }
+        const ULONGLONG until = GetTickCount64() + logDelay;
+        while (GetTickCount64() < until) {
+            if (WaitForSingleObject(stopEvent_, 50) != WAIT_TIMEOUT) {
+                a.drop = true;
+                return a;
+            }
+            if (ClientClosed(t_client)) {
+                ++logAbandoned_;
+                a.drop = true;
+                return a;
+            }
+        }
         const json j = pf::ParseJsonNoThrow(req.body);
         auto it = j.is_object() ? j.find("entries") : j.end();
         if (!j.is_object() || it == j.end() || !it->is_array()) {

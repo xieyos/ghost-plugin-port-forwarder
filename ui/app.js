@@ -356,30 +356,49 @@
     if (sub) td.appendChild(el("span", "sub", sub));
   }
 
+  // The rule with `id` in the latest api/state answer, or null. The row buttons below are
+  // rebuilt only when their own key changes, so they hold nothing but the id: a button that
+  // closed over the rule object of its last rebuild would open the editor on a stale copy,
+  // and saving that form would silently revert whatever changed since.
+  function currentRule(id) {
+    var list = (state && state.rules) || [];
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
+    return null;
+  }
+
+  function editRule(id) {
+    var cur = currentRule(id);
+    if (cur) openEditor(cur);
+  }
+
+  function toggleRule(id) {
+    var cur = currentRule(id);
+    if (cur) write("api/rules/" + id + (cur.enabled ? "/disable" : "/enable"), {});
+  }
+
   function renderActions(row, r) {
-    var key = (r.enabled ? "1" : "0") + (pendingDelete[r.id] ? "d" : "") + lang;
+    var id = r.id;
+    var key = (r.enabled ? "1" : "0") + (pendingDelete[id] ? "d" : "") + lang;
     if (row.actionKey === key) return;
     row.actionKey = key;
     var td = row.cells.actions;
     td.replaceChildren();
-    if (pendingDelete[r.id]) {
+    if (pendingDelete[id]) {
       td.appendChild(el("span", "muted", t("delete_confirm")));
       td.appendChild(button(t("yes"), "small danger", function () {
-        delete pendingDelete[r.id];
-        write("api/rules/" + r.id + "/delete", {});
+        delete pendingDelete[id];
+        write("api/rules/" + id + "/delete", {});
       }));
       td.appendChild(button(t("no"), "small", function () {
-        delete pendingDelete[r.id];
+        delete pendingDelete[id];
         render();
       }));
       return;
     }
-    td.appendChild(button(t("edit"), "small", function () { openEditor(r); }));
-    td.appendChild(button(r.enabled ? t("disable") : t("enable"), "small", function () {
-      write("api/rules/" + r.id + (r.enabled ? "/disable" : "/enable"), {});
-    }));
+    td.appendChild(button(t("edit"), "small", function () { editRule(id); }));
+    td.appendChild(button(r.enabled ? t("disable") : t("enable"), "small", function () { toggleRule(id); }));
     td.appendChild(button(t("delete"), "small danger", function () {
-      pendingDelete[r.id] = true;
+      pendingDelete[id] = true;
       render();
     }));
   }
@@ -547,7 +566,11 @@
     var activeText = t("eg_active");
     if (ready && nodes.active) activeText += " (" + nodeName(nodes.active) + ")";
     if (!ready) activeText += " " + t("eg_needs_ghost");
-    sel.appendChild(option("active", activeText, !ready && current !== "active"));
+    // An option that cannot work is disabled, always -- also when it is what the rule says.
+    // That option stays selected (a script may select a disabled option) with a hint under
+    // the list: switching the rule to "direct" behind the user's back would be worse. Once
+    // the user picks something else, it cannot be picked again.
+    sel.appendChild(option("active", activeText, !ready));
     var found = current === "direct" || current === "active";
     nodes.list.forEach(function (n) {
       if (!n || typeof n.id !== "string") return;
@@ -557,13 +580,11 @@
       if (!n.valid) { text += " " + t("eg_invalid"); off = true; }
       else if (proto === "udp" && !n.udp) { text += " " + t("eg_no_udp"); off = true; }
       if (v === current) found = true;
-      // A disabled choice stays selectable only when it is what the rule already says:
-      // switching the rule to "direct" behind the user's back would be worse.
-      sel.appendChild(option(v, text, off && v !== current));
+      sel.appendChild(option(v, text, off));
     });
     if (!found && current.indexOf("node:") === 0) {
       sel.appendChild(option(current, t("eg_node") + current.slice(5) + " " +
-                             (ready ? t("eg_missing") : t("eg_needs_ghost"))));
+                             (ready ? t("eg_missing") : t("eg_needs_ghost")), true));
     }
     sel.value = current;
     updateEgressHint();
@@ -575,8 +596,9 @@
     var text = "";
     if (v !== "direct" && !ghostReady()) {
       text = t("eg_hint_ghost");
-    } else if (v.indexOf("node:") === 0) {
-      var id = v.slice(5);
+    } else if (v === "active" || v.indexOf("node:") === 0) {
+      // "Follow the active node" is judged by the node that is active now.
+      var id = v === "active" ? nodes.active : v.slice(5);
       nodes.list.forEach(function (n) {
         if (n.id !== id) return;
         if (!n.valid) text = t("eg_hint_invalid");

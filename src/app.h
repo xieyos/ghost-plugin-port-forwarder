@@ -96,7 +96,9 @@ public:
     // The UI server's handler.
     UiResponse Handle(const UiRequest& req);
 
-    // Refuses writes from now on, then Engine::Stop (bounded by engineStopBudgetMs).
+    // Refuses writes from now on, then Engine::Stop (bounded by engineStopBudgetMs), then
+    // waits for a write already past its check to finish (its Apply returns at once after the
+    // engine stopped), so that when Stop() returns no rule change is half done.
     void Stop();
 
     std::vector<Rule> Rules() const;
@@ -111,6 +113,15 @@ private:
     UiResponse DeleteRule(const std::string& id);
     UiResponse Quit();
     UiResponse Asset(const std::string& name);
+
+    // Engine::Apply with engineBusy_ raised, then refreshes the status cache.
+    void ApplyRules(const std::vector<Rule>& rules);
+    // api/state's statuses: the engine's own snapshot, or -- while an Apply or the Stop holds
+    // the engine's lock -- the last one taken, rather than waiting up to the engine's stop
+    // budget. (A poll that checked just before an Apply took the lock still waits; the next
+    // one does not.)
+    std::vector<RuleStatus> StatusesForPage();
+    void CacheSnapshot(std::vector<RuleStatus> s);
 
     // ValidateSet + Save + Apply, under writeMu_. `what` and `rule` name the change for the log.
     UiResponse Commit(std::vector<Rule> next, const char* what, const Rule& rule);
@@ -132,6 +143,9 @@ private:
     uint64_t addrAt_ = 0;
     bool haveAddrs_ = false;
     std::atomic<bool> stopping_{false};
+    std::atomic<int> engineBusy_{0};
+    std::mutex snapMu_;
+    std::vector<RuleStatus> snapCache_;
 };
 
 }  // namespace pf

@@ -9,6 +9,7 @@
 #include "app.h"
 #include "fake_ghost.h"
 #include "http_client.h"
+#include "port_reserve.h"
 #include "rule_store.h"
 #include "test_support.h"
 #include "tunnel_client.h"
@@ -22,6 +23,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 using pf::json;
@@ -33,15 +35,10 @@ namespace {
 
 const char* kLanAddr = "192.0.2.10";  // the one "local" adapter address the rigs report
 
-int FreePort() {
-    static std::set<int> handed;
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        pf_test::LoopbackListener l;
-        if (!pf_test::ListenLoopback(&l)) return 0;
-        if (handed.insert(l.port).second) return l.port;
-    }
-    return 0;
-}
+// A listen or remote port for a rule, held for TCP and UDP (support/port_reserve.h) until
+// the rule that listens on it is posted (Rig::Post lets it go): nothing else on the machine
+// can take it in between.
+int FreePort() { return pf_test::ReservePort(); }
 
 struct RigOptions {
     bool hosted = false;
@@ -71,6 +68,11 @@ struct Rig {
 
     HttpReply Get(const std::string& sub) const { return RawHttp(port, BuildRequest("GET", P(sub), port)); }
     HttpReply Post(const std::string& sub, const json& body) const {
+        // The rule may listen on its port as soon as it is saved.
+        if (body.is_object() && body.contains("listen") && body["listen"].is_object()) {
+            long long p = 0;
+            if (pf::JsonGetInt64(body["listen"], "port", &p)) pf_test::ReleasePort(static_cast<int>(p));
+        }
         return RawHttp(port, BuildRequest("POST", P(sub), port, pf::DumpSafe(body), Origin(), "application/json"));
     }
     json State() const { return pf::ParseJsonNoThrow(Get("api/state").body); }
@@ -159,8 +161,8 @@ std::string IdOf(const HttpReply& r) {
 
 void CspAndUrlRules() {
     CHECK(pf::UiCsp("http://127.0.0.1:23551") ==
-          "default-src 'self'; img-src 'self' data:; frame-ancestors http://127.0.0.1:23551");
-    CHECK(pf::UiCsp("") == "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'");
+          "default-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors http://127.0.0.1:23551");
+    CHECK(pf::UiCsp("") == "default-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'");
     // Anything but a plain loopback origin frames nothing.
     CHECK(pf::UiCsp("http://evil.example:23551").find("frame-ancestors 'none'") != std::string::npos);
     CHECK(pf::UiCsp("http://127.0.0.1:23551; script-src *").find("frame-ancestors 'none'") != std::string::npos);
@@ -204,7 +206,7 @@ void ServesThePageWithItsHeaders() {
     const HttpReply page = rig->Get("");
     CHECK_MSG(page.status == 200, page.raw.substr(0, 200).c_str());
     CHECK(page.Header("Content-Security-Policy") ==
-          "default-src 'self'; img-src 'self' data:; frame-ancestors http://127.0.0.1:23551");
+          "default-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors http://127.0.0.1:23551");
     CHECK(page.Header("X-Content-Type-Options") == "nosniff");
     CHECK(page.Header("Referrer-Policy") == "no-referrer");
     CHECK(page.Header("Cache-Control") == "no-store");
@@ -228,7 +230,7 @@ void ServesThePageWithItsHeaders() {
     CHECK(alone != nullptr);
     if (alone) {
         CHECK(alone->Get("").Header("Content-Security-Policy") ==
-              "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'");
+              "default-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'");
     }
 }
 
@@ -371,6 +373,28 @@ void MalformedRequests() {
     CHECK(RawHttp(rig->port, "GET " + rig->P("") + " HTTP/1.1\r\n" + host + " folded\r\n\r\n").status == 400);
     CHECK(RawHttp(rig->port, "GET " + rig->P("") + " HTTP/1.1\r\n" + host + "Bad Name: x\r\n\r\n").status == 400);
     CHECK(RawHttp(rig->port, "GET " + rig->P("") + " HTTP/1.1\r\n" + host + "X: a\nb\r\n\r\n").status == 400);
+    // A control character other than tab in a header -- DEL, NUL -- is not HTTP.
+    CHECK(RawHttp(rig->port, "GET " + rig->P("") + " HTTP/1.1\r\n" + host + "X: a\x7f" "b\r\n\r\n").status == 400);
+    CHECK(RawHttp(rig->port, "GET " + rig->P("") + " HTTP/1.1\r\n" + host + std::string("X: a\0b\r\n\r\n", 10))
+              .status == 400);
+    CHECK(RawHttp(rig->port, "GET " + rig->P("") + " HTTP/1.1\r\n" + host + "X: a\tb\r\n\r\n").status == 200);
+    // Two Content-Length headers, even equal ones: 400 bad_request from the parser (zero, so
+    // that no other check -- excess bytes, the body -- could give the same answer).
+    const std::string post = "POST " + rig->P("api/rules") + " HTTP/1.1\r\n" + host + "Origin: " + rig->Origin() +
+                             "\r\nContent-Type: application/json\r\n";
+    const HttpReply twoLengths = RawHttp(rig->port, post + "Content-Length: 0\r\nContent-Length: 0\r\n\r\n");
+    CHECK(twoLengths.status == 400 && ErrorOf(twoLengths) == pf::ui_err::kBadRequest);
+    const HttpReply oneLength = RawHttp(rig->port, post + "Content-Length: 0\r\n\r\n");
+    CHECK(oneLength.status == 400 && ErrorOf(oneLength) == pf::app_err::kBadBody);
+    // More bytes than Content-Length announced (sent in one piece, so they arrive with the
+    // head): 400, never a second request read out of the first.
+    const HttpReply longer = RawHttp(rig->port, post + "Content-Length: 2\r\n\r\n{}GET / HTTP/1.1\r\n\r\n");
+    CHECK(longer.status == 400 && ErrorOf(longer) == pf::ui_err::kBadRequest);
+    // The same request with an honest length is accepted (so the two rows above fail for
+    // their one reason): {} is not a rule.
+    const HttpReply honest = RawHttp(rig->port, post + "Content-Length: 2\r\n\r\n{}");
+    CHECK(honest.status == 400 && ErrorOf(honest) == pf::rule_err::kBadName);
+    CHECK(rig->State()["rules"].empty());
     CHECK(RawHttp(rig->port, "PUT " + rig->P("api/rules") + " HTTP/1.1\r\n" + host + "\r\n").status == 405);
     CHECK(rig->Get("api/rules").status == 405);
     CHECK(rig->Post("api/state", json::object()).status == 405);
@@ -418,6 +442,41 @@ void ConnectionLimitAndSlowClients() {
     closesocket(a);
     closesocket(b);
     CHECK(rig->Get("api/state").status == 200);
+}
+
+// Stop() waits at most stopWaitMs for a handler it cannot reach, and a second Stop() (the
+// destructor's, after the owner's exit deadline was planned around the first) returns at once.
+void StopIsBoundedAndIdempotent() {
+    HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    auto entered = std::make_shared<std::atomic<bool>>(false);
+    pf::UiServerOptions uo;
+    uo.stopWaitMs = 300;
+    uo.handler = [release, entered](const pf::UiRequest&) {
+        entered->store(true);
+        WaitForSingleObject(release, 10000);  // a handler blocked in a call no flag reaches
+        return pf::UiResponse();
+    };
+    auto ui = std::make_unique<pf::UiServer>(uo);
+    std::string err;
+    CHECK(ui->Start(&err));
+    const unsigned short port = ui->port();
+    const std::string prefix = ui->prefix();
+    std::thread client([port, prefix] { RawHttp(port, BuildRequest("GET", "/" + prefix + "/x", port), 15000); });
+    CHECK(pf_test::WaitUntil([&] { return entered->load(); }, 3000));
+
+    ULONGLONG t0 = GetTickCount64();
+    ui->Stop();
+    const ULONGLONG first = GetTickCount64() - t0;
+    CHECK_MSG(first >= 250 && first < 1500, ("first Stop took " + std::to_string(first) + " ms").c_str());
+    CHECK(ui->ActiveConnections() == 1);  // the blocked handler, left running
+    t0 = GetTickCount64();
+    ui->Stop();
+    ui.reset();  // ~UiServer calls Stop() once more
+    const ULONGLONG second = GetTickCount64() - t0;
+    CHECK_MSG(second < 100, ("second Stop and the destructor took " + std::to_string(second) + " ms").c_str());
+    SetEvent(release);
+    client.join();
+    CloseHandle(release);
 }
 
 // ---- The API ----------------------------------------------------------------------------------
@@ -738,6 +797,7 @@ int main() {
     SizeLimits();
     MalformedRequests();
     ConnectionLimitAndSlowClients();
+    StopIsBoundedAndIdempotent();
     AddRuleShowsInStateAndRuns();
     LanNeedsAck();
     ConflictsAndValidation();

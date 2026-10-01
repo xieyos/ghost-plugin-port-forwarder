@@ -106,12 +106,46 @@ LoadResult App::LoadRules() {
 void App::StartEngine() {
     std::lock_guard<std::mutex> w(writeMu_);
     if (stopping_.load()) return;
-    engine_->Apply(Rules());
+    ApplyRules(Rules());
+}
+
+void App::ApplyRules(const std::vector<Rule>& rules) {
+    // While the engine holds its lock (stopping forwarders takes up to its budget), api/state
+    // answers from the cache instead of waiting behind it.
+    ++engineBusy_;
+    try {
+        engine_->Apply(rules);
+    } catch (...) {
+        --engineBusy_;
+        throw;
+    }
+    --engineBusy_;
+    CacheSnapshot(engine_->Snapshot());
+}
+
+void App::CacheSnapshot(std::vector<RuleStatus> s) {
+    std::lock_guard<std::mutex> lock(snapMu_);
+    snapCache_ = std::move(s);
+}
+
+std::vector<RuleStatus> App::StatusesForPage() {
+    if (engineBusy_.load() == 0) {
+        std::vector<RuleStatus> s = engine_->Snapshot();
+        CacheSnapshot(s);
+        return s;
+    }
+    std::lock_guard<std::mutex> lock(snapMu_);
+    return snapCache_;
 }
 
 void App::Stop() {
     stopping_.store(true);
-    engine_->Stop();
+    ++engineBusy_;
+    engine_->Stop();  // ends an Apply in progress early (engine.h)
+    // Then wait out a write that passed its stopping_ check before it was set: after Stop()
+    // returns, no write is between Save and Apply any more, so nothing is saved that the
+    // shutdown does not know about. Bounded: the Apply in it returns at once now.
+    std::lock_guard<std::mutex> w(writeMu_);
 }
 
 std::vector<Rule> App::Rules() const {
@@ -209,7 +243,7 @@ UiResponse App::Asset(const std::string& name) {
 
 UiResponse App::State() {
     const std::vector<Rule> rules = Rules();
-    const std::vector<RuleStatus> statuses = engine_->Snapshot();
+    const std::vector<RuleStatus> statuses = StatusesForPage();
     json out = json::object();
     out["version"] = PF_VERSION;
     out["hosted"] = opts_.hosted;
@@ -302,7 +336,7 @@ UiResponse App::Commit(std::vector<Rule> next, const char* what, const Rule& rul
     }
     Log(LogLevel::Info, std::string("rule ") + what + ": " + rule.name,
         {{"rule", rule.id}, {"proto", ProtoName(rule.proto)}, {"egress", EgressKindName(rule.egress)}});
-    engine_->Apply(next);
+    ApplyRules(next);
     json ok = json::object();
     ok["ok"] = true;
     ok["id"] = rule.id;

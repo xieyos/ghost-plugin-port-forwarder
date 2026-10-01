@@ -293,7 +293,7 @@ void HostedHandshakeAndStop(pf_test::FakeGhost& ghost) {
         const pf_test::HttpReply page = pf_test::RawHttp(port, pf_test::BuildRequest("GET", "/" + prefix + "/", port));
         CHECK_MSG(page.status == 200, page.raw.substr(0, 200).c_str());
         CHECK(page.Header("Content-Security-Policy") ==
-              "default-src 'self'; img-src 'self' data:; frame-ancestors " + g_apiBase);
+              "default-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors " + g_apiBase);
         CHECK(page.body.find("app.js") != std::string::npos);
         // The API answers once the rules are loaded; the language is the handshake's.
         json state;
@@ -334,6 +334,47 @@ void HostedHandshakeAndStop(pf_test::FakeGhost& ghost) {
     CHECK_MSG(started, "the start line reached log.write");
     CHECK_MSG(stopping, "the last batch was sent before the API shut down");
     CHECK(!leaked);
+    CloseHandle(ev);
+}
+
+// Ghost stalls on log.write (answers never come): the process still exits with code 0 within
+// the host's 3 s -- the exit deadline aborts the stuck request and the last batch is dropped,
+// not waited for.
+void HostedStalledLogStillExits(pf_test::FakeGhost& ghost) {
+    ghost.SetLogIngestDelayMs(60000);
+    const size_t before = ghost.Requests().size();
+    const int abandonedBefore = ghost.LogIngestAbandoned();
+    const std::string name = UniqueName("stall");
+    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, pf::Utf8ToWide(name).c_str());
+    Child c;
+    CHECK(c.Start(HostedEnv(name)));
+    CHECK(c.WriteStdin(pf::DumpSafe(Handshake(name)) + "\n"));
+    CHECK_MSG(!UiUrlOfReceipt(c.FirstLine(10000)).empty(), "receipt");
+    // The start line is on the wire and stuck: the fake has read it and is not answering.
+    auto ingests = [&] {
+        int n = 0;
+        const auto all = ghost.Requests();
+        for (size_t i = before; i < all.size(); ++i)
+            if (all[i].path == "/api/log-ingest") ++n;
+        return n;
+    };
+    CHECK(pf_test::WaitUntil([&] { return ingests() >= 1; }, 5000));
+
+    const ULONGLONG t0 = GetTickCount64();
+    SetEvent(ev);
+    DWORD code = 12345;
+    const bool exited = c.ExitsWithin(3000, &code);
+    CHECK_MSG(exited, ("exits within 3 s although Ghost never answers (" + std::to_string(GetTickCount64() - t0) +
+                       " ms)").c_str());
+    CHECK_MSG(code == 0, ("exit code " + std::to_string(code)).c_str());
+    // The stuck request was abandoned, and the stop line never went out behind it.
+    CHECK(pf_test::WaitUntil([&] { return ghost.LogIngestAbandoned() > abandonedBefore; }, 2000));
+    const auto all = ghost.Requests();
+    for (size_t i = before; i < all.size(); ++i) {
+        CHECK_MSG(all[i].body.find("Port Forwarder stopping") == std::string::npos, "the stop line was dropped");
+    }
+    CHECK(ingests() == 1);
+    ghost.SetLogIngestDelayMs(0);
     CloseHandle(ev);
 }
 
@@ -425,7 +466,7 @@ void StandalonePageAndQuit() {
     const pf_test::HttpReply page = pf_test::RawHttp(port, pf_test::BuildRequest("GET", "/" + prefix + "/", port));
     CHECK(page.status == 200);
     CHECK(page.Header("Content-Security-Policy") ==
-          "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'");
+          "default-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'; frame-ancestors 'none'");
     const json state = pf::ParseJsonNoThrow(
         pf_test::RawHttp(port, pf_test::BuildRequest("GET", "/" + prefix + "/api/state", port)).body);
     CHECK(state.is_object() && state["hosted"] == false && state["canQuit"] == true && state["ghost"] == "needs_ghost");
@@ -515,6 +556,7 @@ int wmain(int argc, wchar_t** argv) {
     g_apiBase = ghost.apiBase();
 
     HostedHandshakeAndStop(ghost);
+    HostedStalledLogStillExits(ghost);
     HostedHandshakeDeclined();
     HostedUnopenableStopEventBlocks();
     StandaloneDoesNotReadStdin();
