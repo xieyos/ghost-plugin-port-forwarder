@@ -122,7 +122,7 @@ jobs:
       # The public SDK and the commit whose tools/plugin packs and signs this release. A commit,
       # never a branch: the tool that signs a release must not change behind the maintainer's back.
       SDK_REPO: liliBestCoder/ghost-plugin-sdk
-      SDK_REF: bb6a5d27b772d21d9dae54b82479c3d3f2f02883
+      SDK_REF: bb0c51dc64587e0dbe898fd554593eb28438a11a
       # The first Ghost with upstream.connect; gpkg.py refuses anything lower for this manifest.
       MIN_APP_VERSION: 1.2.1
     steps:

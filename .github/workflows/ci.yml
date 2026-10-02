@@ -18,7 +18,7 @@ jobs:
       # The public SDK whose packer the packing check runs -- the same commit release.yml
       # packs and signs with (tests/check_workflows.py keeps the two equal).
       SDK_REPO: liliBestCoder/ghost-plugin-sdk
-      SDK_REF: bb6a5d27b772d21d9dae54b82479c3d3f2f02883
+      SDK_REF: bb0c51dc64587e0dbe898fd554593eb28438a11a
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
