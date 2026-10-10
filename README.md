@@ -52,7 +52,7 @@ Windows 防火墙会在第一次监听时弹框：**只允许「专用网络」*
 
 ### 独立运行
 
-不经 Ghost 直接运行 `port-forwarder.exe`：
+不经 Ghost 直接运行 `port-forwarder.exe`（每个 [Release](https://github.com/xieyos/ghost-plugin-port-forwarder/releases/latest) 都附带这个文件，单文件、免安装，与插件包里的那个逐字节相同）：
 
 - 只支持直连规则；经节点的规则显示 `needs_ghost` 且不监听。
 - 数据目录 `%LOCALAPPDATA%\com.qtvz.xieyos.port-forwarder\`（规则 `rules.json`、日志 `port-forwarder.log`，滚动 1 MB × 2）。
@@ -139,7 +139,7 @@ Windows Firewall asks the first time the plugin listens: **allow private network
 
 ### Standalone
 
-Run `port-forwarder.exe` without Ghost:
+Run `port-forwarder.exe` without Ghost (every [Release](https://github.com/xieyos/ghost-plugin-port-forwarder/releases/latest) carries it: one file, no installer, byte for byte the one inside the plugin package):
 
 - Direct rules only; via-node rules show `needs_ghost` and do not listen.
 - Data directory `%LOCALAPPDATA%\com.qtvz.xieyos.port-forwarder\` (rules in `rules.json`, log in `port-forwarder.log`, rolled at 1 MB x 2).

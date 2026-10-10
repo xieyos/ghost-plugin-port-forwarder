@@ -360,6 +360,12 @@ def publish_problems(rel):
         out.append("release.yml: an existing release is not updated with gh release upload --clobber")
     if not re.search(r"gh release create [^\n]*--verify-tag", body):
         out.append("release.yml: gh release create must keep --verify-tag")
+    # Both branches publish the same four files: the three Ghost downloads, and the standalone
+    # program taken from pkg/ (the file that was packed, not a second build).
+    assets = "dist/ghost-plugin.json dist/ghost-plugin.json.sig dist/*.gpkg pkg/port-forwarder.exe"
+    if body.count(assets) != 2:
+        out.append("release.yml: create and upload must both publish the descriptor, its signature, "
+                   "the package and pkg/port-forwarder.exe")
     return out
 
 

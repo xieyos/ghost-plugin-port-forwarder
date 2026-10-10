@@ -197,14 +197,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         # A re-run after a successful create must not fail on "release already exists": the
-        # assets are uploaded again over the existing ones (all three, so the descriptor, its
+        # assets are uploaded again over the existing ones (all of them, so the descriptor, its
         # signature and the package stay one set).
+        #
+        # The fourth asset is the standalone program: pkg/port-forwarder.exe, the very file
+        # that was packed (byte for byte the one inside the .gpkg). Ghost never downloads it;
+        # it is for running the forwarder without Ghost.
         run: |
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
-              dist/ghost-plugin.json dist/ghost-plugin.json.sig dist/*.gpkg
+              dist/ghost-plugin.json dist/ghost-plugin.json.sig dist/*.gpkg pkg/port-forwarder.exe
           else
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
               --title "Port Forwarder ${GITHUB_REF_NAME#v}" --notes "See CHANGELOG.md." \
-              dist/ghost-plugin.json dist/ghost-plugin.json.sig dist/*.gpkg
+              dist/ghost-plugin.json dist/ghost-plugin.json.sig dist/*.gpkg pkg/port-forwarder.exe
           fi
