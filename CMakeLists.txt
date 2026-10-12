@@ -128,7 +128,12 @@ set_source_files_properties("${PF_GEN_DIR}/resources.rc" PROPERTIES OBJECT_DEPEN
 
 # ---- Compiler and linker flags ---------------------------------------------------
 add_compile_options(
-  "$<$<COMPILE_LANGUAGE:CXX>:/W4;/WX;/permissive-;/utf-8;/guard:cf;/EHsc;/Zc:__cplusplus>")
+  "$<$<COMPILE_LANGUAGE:CXX>:/permissive-;/utf-8;/guard:cf;/EHsc;/Zc:__cplusplus>")
+# /W4 /WX is for this project's own code, given to each of its targets (pf_strict) -- not
+# to the C++ the Slint compiler generates into pf_gui, which is Slint's and warns at /W4.
+function(pf_strict target)
+  target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/WX>")
+endfunction()
 add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00
                         JSON_USE_IMPLICIT_CONVERSIONS=0)
 add_link_options(/guard:cf /CETCOMPAT)
@@ -157,13 +162,15 @@ target_include_directories(pf_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
   "${PF_GEN_DIR}")
 target_link_libraries(pf_core PUBLIC bcrypt iphlpapi ole32 shell32 winhttp ws2_32)
+pf_strict(pf_core)
 
 # ---- pf_gui: the standalone window, the one part built against Slint (C++20) -----------
-# Slint's headers and the generated one are included with angle brackets and held to no
-# warning level: /W4 /WX is for this project's code.
+# gui.cpp is held to /W4 /WX; the Slint compiler's own .cpp next to it is not, and Slint's
+# headers and the generated one are included with angle brackets as external headers.
 add_library(pf_gui STATIC src/gui.cpp)
 target_link_libraries(pf_gui PRIVATE pf_core Slint::Slint)
 slint_target_sources(pf_gui src/gui/main_window.slint)
+set_source_files_properties(src/gui.cpp PROPERTIES COMPILE_OPTIONS "/W4;/WX")
 # Images (the icon, AboutSlint's logo) go into the exe, never as a path on the build machine.
 set_property(TARGET pf_gui PROPERTY SLINT_EMBED_RESOURCES embed-files)
 target_compile_options(pf_gui PRIVATE /external:anglebrackets /external:W0)
@@ -174,6 +181,7 @@ add_executable(port-forwarder
   "${PF_GEN_DIR}/version.rc"
   "${PF_GEN_DIR}/resources.rc")
 target_link_libraries(port-forwarder PRIVATE pf_core pf_gui)
+pf_strict(port-forwarder)
 set_target_properties(port-forwarder PROPERTIES OUTPUT_NAME "port-forwarder")
 
 enable_testing()

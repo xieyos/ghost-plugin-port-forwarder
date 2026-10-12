@@ -12,6 +12,7 @@ target_link_libraries(pf_test_support INTERFACE pf_core ws2_32)
 # The fake Ghost control interface (support/fake_ghost.h): an HTTP server and a socket
 # handover, no proxy protocol. Linked by the tests that talk to "Ghost".
 add_library(pf_fake_ghost STATIC support/fake_ghost.cpp)
+pf_strict(pf_fake_ghost)
 target_link_libraries(pf_fake_ghost PUBLIC pf_test_support)
 
 function(pf_add_test name label)
@@ -23,6 +24,7 @@ function(pf_add_test name label)
     message(FATAL_ERROR "pf_add_test(${name}): SOURCES is required")
   endif()
   add_executable(${name} ${T_SOURCES})
+  pf_strict(${name})
   target_link_libraries(${name} PRIVATE pf_test_support ${T_LIBS})
   if(T_DEPENDS)
     add_dependencies(${name} ${T_DEPENDS})
