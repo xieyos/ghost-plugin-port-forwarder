@@ -298,10 +298,6 @@ export component MainWindow inherits Window {
                 enabled: !root.loading && !root.busy;
                 clicked => { root.add-rule(); }
             }
-            Button {
-                text: Tr.t("关于", "About");
-                clicked => { root.about-open = true; }
-            }
         }
 
         if root.loading: Muted {
@@ -544,7 +540,14 @@ export component MainWindow inherits Window {
                     text: "MIT License · © 2026 xieyos · github.com/xieyos/ghost-plugin-port-forwarder";
                     wrap: word-wrap;
                 }
-                AboutSlint { }
+                // The licence's attribution: shown as Slint made it, at its smallest size.
+                HorizontalLayout {
+                    alignment: start;
+                    AboutSlint {
+                        width: 150px;
+                        height: self.min-height;
+                    }
+                }
                 HorizontalLayout {
                     alignment: end;
                     Button {
