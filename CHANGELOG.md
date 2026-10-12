@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Standalone, `port-forwarder.exe` now opens a native window (Slint) instead of a browser
+  page: the rules with their status and counters, the same editor and checks as the page
+  (every change still goes through the plugin's own API), Chinese and English, light and dark.
+  Closing the window stops all forwarding. Hosted in Ghost, nothing changes: Ghost shows the
+  management page.
+- `--web` opens the management page in the browser instead of the window (the old default);
+  `--no-browser` is unchanged (the page only, nothing opened).
+- Building needs a Rust toolchain (1.92 or later): Slint 1.18.1 is compiled from source and
+  linked statically, so a release is still one exe. Slint is used under the Slint Royalty-free
+  License 2.0 (AboutSlint in Help > About); its notices and those of its Rust dependencies are
+  in THIRD_PARTY_NOTICES.txt.
+
 ## 1.0.0
 
 First release.

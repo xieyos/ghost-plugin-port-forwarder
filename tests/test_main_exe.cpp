@@ -5,14 +5,18 @@
 // there and may be framed by Ghost only, the stop event ends the process within 3 s.
 // Standalone (--no-browser --data-dir): stdin is never read, the page's address is printed,
 // the page is served, its Stop button ends the process, and a second instance on the same
-// data directory refuses to start.
+// data directory refuses to start. Standalone without --no-browser: the window opens, the
+// rules run while it is open, no page is served, and closing the window ends the process.
 //
 // argv[1] = path of port-forwarder.exe, argv[2] = path of manifest.json.
 
+#include "echo_servers.h"
 #include "fake_ghost.h"
 #include "http_client.h"
 #include "json_util.h"
 #include "plugin_child.h"
+#include "port_reserve.h"
+#include "tcp_client.h"
 #include "test_support.h"
 #include "util_str.h"
 
@@ -265,6 +269,82 @@ void StandalonePageAndQuit() {
     CHECK(GetFileAttributesW((dir.path() + L"\\port-forwarder.log").c_str()) != INVALID_FILE_ATTRIBUTES);
 }
 
+// The visible top-level window of process `pid`, or null.
+HWND WindowOf(DWORD pid) {
+    struct Find {
+        DWORD pid;
+        HWND found;
+    } find = {pid, nullptr};
+    EnumWindows(
+        [](HWND h, LPARAM lp) -> BOOL {
+            auto* f = reinterpret_cast<Find*>(lp);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(h, &owner);
+            if (owner != f->pid || !IsWindowVisible(h) || GetWindow(h, GW_OWNER) != nullptr) return TRUE;
+            f->found = h;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&find));
+    return find.found;
+}
+
+// Standalone, the default: the window. A direct rule from rules.json forwards while it is open;
+// no page server is started (no address printed); closing the window -- WM_CLOSE, what its
+// title bar's X sends -- ends the process within the shutdown budget.
+void StandaloneWindow() {
+    pf_test::ScopedTempDir dir;
+    pf_test::TcpEchoServer echo;
+    CHECK(echo.Start());
+    const int port = pf_test::ReservePort();
+    CHECK(port != 0);
+    json rule = {{"id", "r_00000000000000a1"},
+                 {"name", "window"},
+                 {"enabled", true},
+                 {"proto", "tcp"},
+                 {"listen", {{"addr", "127.0.0.1"}, {"port", port}}},
+                 {"remote", {{"host", "127.0.0.1"}, {"port", echo.port()}}},
+                 {"egress", {{"kind", "direct"}}},
+                 {"limits", {{"maxConnections", 16}, {"udpIdleSec", 60}}},
+                 {"lanAck", false}};
+    const std::string doc = json{{"v", 1}, {"rules", json::array({rule})}}.dump();
+    FILE* f = nullptr;
+    CHECK(_wfopen_s(&f, (dir.path() + L"\\rules.json").c_str(), L"wb") == 0 && f);
+    if (f) {
+        fwrite(doc.data(), 1, doc.size(), f);
+        fclose(f);
+    }
+    pf_test::ReleasePort(port);
+
+    Child c(g_exe);
+    CHECK(c.Start({}, {L"--data-dir", dir.path()}));
+    const std::string line = c.FirstLine(10000);
+    CHECK_MSG(line.find("standalone") != std::string::npos, line.c_str());
+    CHECK_MSG(line.find("Close the window") != std::string::npos, line.c_str());
+    CHECK_MSG(line.find("http") == std::string::npos, "no page address: the window has no page server");
+
+    HWND w = nullptr;
+    CHECK_MSG(pf_test::WaitUntil([&] { return (w = WindowOf(c.pid())) != nullptr; }, 20000), "a window opens");
+    if (!w) return;
+    wchar_t title[64] = {};
+    GetWindowTextW(w, title, 64);
+    const std::wstring t = title;
+    CHECK_MSG(t == L"Port Forwarder" || t == L"\u7aef\u53e3\u8f6c\u53d1", ("title: " + pf::WideToUtf8(t)).c_str());
+
+    CHECK_MSG(pf_test::WaitUntil(
+                  [&] {
+                      pf::UniqueSocket s = pf_test::Connect(port);
+                      return s && pf_test::RoundTrip(s.get(), "through the window's rule");
+                  },
+                  10000),
+              "the rule forwards while the window is open");
+
+    CHECK(PostMessageW(w, WM_CLOSE, 0, 0));
+    DWORD code = 12345;
+    CHECK_MSG(c.ExitsWithin(5000, &code), "closing the window ends the process");
+    CHECK(code == 0);
+    CHECK_MSG(pf_test::WaitUntil([&] { return pf_test::Refused(port); }, 3000), "and its rule with it");
+}
+
 // The exe's VERSIONINFO comes from manifest.json, its only source.
 void VersionMatchesManifest() {
     std::string text;
@@ -333,6 +413,7 @@ int wmain(int argc, wchar_t** argv) {
     HostedUnopenableStopEventBlocks();
     StandaloneDoesNotReadStdin();
     StandalonePageAndQuit();
+    StandaloneWindow();
     VersionMatchesManifest();
     ghost.Stop();
     return pf_test::TestExitCode();

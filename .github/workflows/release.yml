@@ -27,9 +27,13 @@ concurrency:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 30
+    # Slint (the standalone window) is compiled from source, Rust and all.
+    timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      # The Rust toolchain that builds Slint -- the same one ci.yml builds with.
+      RUSTUP_TOOLCHAIN: '1.97.0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
@@ -72,6 +76,13 @@ jobs:
             exit 1
           }
           "version=$version" >> $env:GITHUB_OUTPUT
+
+      # rustup is on the image; RUSTUP_TOOLCHAIN makes every cargo and rustc below this one.
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --no-self-update
+          rustc --version
 
       - name: Configure
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64

@@ -54,10 +54,12 @@ Windows 防火墙会在第一次监听时弹框：**只允许「专用网络」*
 
 不经 Ghost 直接运行 `port-forwarder.exe`（每个 [Release](https://github.com/xieyos/ghost-plugin-port-forwarder/releases/latest) 都附带这个文件，单文件、免安装，与插件包里的那个逐字节相同）：
 
+- 默认打开一个**原生窗口**（[Slint](https://slint.dev/)）：规则列表、状态与计数、新增/编辑/启用/停用/删除，和插件中心里的管理页一样；「帮助 → 关于」。**关闭窗口即停止所有转发**（「文件 → 退出」同理）。
+- `--web`：不开窗口，改为在默认浏览器里打开管理页（地址也打印在控制台），Ctrl+C 或页面上的「停止」退出。
+- `--no-browser`：不开窗口也不开浏览器，只起管理页（地址打印在控制台），适合无人值守；Ctrl+C 或页面上的「停止」退出。
 - 只支持直连规则；经节点的规则显示 `needs_ghost` 且不监听。
-- 数据目录 `%LOCALAPPDATA%\com.qtvz.xieyos.port-forwarder\`（规则 `rules.json`、日志 `port-forwarder.log`，滚动 1 MB × 2）。
-- `--data-dir <目录>` 换数据目录；`--no-browser` 不自动打开页面（地址打印在控制台）。
-- 同一数据目录只能有一个实例。Ctrl+C 或页面上的「停止」退出。
+- 数据目录 `%LOCALAPPDATA%\com.qtvz.xieyos.port-forwarder\`（规则 `rules.json`、日志 `port-forwarder.log`，滚动 1 MB × 2）；`--data-dir <目录>` 换数据目录。
+- 同一数据目录只能有一个实例。
 
 ### 安全
 
@@ -67,7 +69,7 @@ Windows 防火墙会在第一次监听时弹框：**只允许「专用网络」*
 
 ### 从源码构建
 
-需要 Visual Studio 2022（「使用 C++ 的桌面开发」）与 CMake ≥ 3.20：
+需要 Visual Studio 2022（「使用 C++ 的桌面开发」）、CMake ≥ 3.21，以及 [Rust](https://rustup.rs/) ≥ 1.92（`x86_64-pc-windows-msvc`；CI 钉在 `.github/workflows/ci.yml` 的 `RUSTUP_TOOLCHAIN`）。独立运行的窗口用的 Slint 1.18.1 在配置时从 GitHub 取源码（钉到提交），构建时连同它的 Rust 依赖（按 Slint 自带的 `Cargo.lock`）一起编译、静态链接进 exe——第一次构建要联网，也要多花几分钟：
 
 ```bash
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -89,7 +91,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 ### 许可
 
-MIT，见 [LICENSE](LICENSE)。第三方：nlohmann/json（MIT），见 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)。
+MIT，见 [LICENSE](LICENSE)。第三方见 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt)：nlohmann/json（MIT）；独立运行窗口用的 [Slint](https://slint.dev/) 按 **Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0** 使用——它要求在应用顶层菜单可达的「关于」对话框里显示 `AboutSlint` 控件（本程序：「帮助 → 关于」），改界面时不要去掉；Slint 的 Rust 依赖各自的许可也在该文件里。
 
 ---
 
@@ -141,10 +143,12 @@ Windows Firewall asks the first time the plugin listens: **allow private network
 
 Run `port-forwarder.exe` without Ghost (every [Release](https://github.com/xieyos/ghost-plugin-port-forwarder/releases/latest) carries it: one file, no installer, byte for byte the one inside the plugin package):
 
+- By default it opens a **native window** ([Slint](https://slint.dev/)): the rules with their status and counters; add, edit, enable, disable and delete -- the same as the management page in the plugin center; Help > About. **Closing the window stops all forwarding** (so does File > Exit).
+- `--web`: no window; the management page opens in the default browser instead (its address is also printed on the console). Ctrl+C or the page's Stop button ends it.
+- `--no-browser`: no window and no browser; only the management page (its address printed on the console), for unattended use. Ctrl+C or the page's Stop button ends it.
 - Direct rules only; via-node rules show `needs_ghost` and do not listen.
-- Data directory `%LOCALAPPDATA%\com.qtvz.xieyos.port-forwarder\` (rules in `rules.json`, log in `port-forwarder.log`, rolled at 1 MB x 2).
-- `--data-dir <dir>` uses another data directory; `--no-browser` does not open the page (the address is printed on the console).
-- One instance per data directory. Ctrl+C or the page's Stop button ends it.
+- Data directory `%LOCALAPPDATA%\com.qtvz.xieyos.port-forwarder\` (rules in `rules.json`, log in `port-forwarder.log`, rolled at 1 MB x 2); `--data-dir <dir>` uses another one.
+- One instance per data directory.
 
 ### Security
 
@@ -154,7 +158,7 @@ Run `port-forwarder.exe` without Ghost (every [Release](https://github.com/xieyo
 
 ### Building from source
 
-Visual Studio 2022 ("Desktop development with C++") and CMake 3.20 or later:
+Visual Studio 2022 ("Desktop development with C++"), CMake 3.21 or later, and [Rust](https://rustup.rs/) 1.92 or later (`x86_64-pc-windows-msvc`; CI pins it as `RUSTUP_TOOLCHAIN` in `.github/workflows/ci.yml`). Slint 1.18.1, the standalone window's toolkit, is fetched from GitHub at configure time (pinned to its commit) and compiled with its Rust dependencies (from Slint's own `Cargo.lock`) into the exe, statically -- the first build needs the network and takes a few minutes longer:
 
 ```bash
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -176,4 +180,4 @@ The private key never goes into the repository (`.gitignore` blocks `*.pem`, `*.
 
 ### License
 
-MIT, see [LICENSE](LICENSE). Third party: nlohmann/json (MIT), see [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+MIT, see [LICENSE](LICENSE). Third party, see [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt): nlohmann/json (MIT); [Slint](https://slint.dev/), the standalone window's toolkit, used under the **Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0** -- which requires the `AboutSlint` widget in an About dialog reachable from the application's top-level menu (here: Help > About); keep it when changing the window. The licences of Slint's Rust dependencies are in the same file.
