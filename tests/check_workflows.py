@@ -16,6 +16,7 @@ Then the invariants of these workflows:
   * the workflow directory holds exactly ci.yml and release.yml (an empty traversal never passes);
   * every `uses:` is pinned to a 40-hex commit with a `# vX.Y.Z` comment;
   * SDK_REPO / SDK_REF are the same in both files, SDK_REF a 40-hex commit;
+  * RUSTUP_TOOLCHAIN (the Rust that builds Slint) is the same in both files, an exact version;
   * release.yml: the SDK_REF guard runs before any checkout, the secret is named exactly once,
     and pip installs with --require-hashes --only-binary=:all:;
   * release.yml: the build job's first step after its checkout checks dev-public.b64 (exists,
@@ -407,7 +408,7 @@ def main(argv):
             problems.append("%s: no `uses:` found -- the pin check would be vacuous" % f)
 
     if len(texts) == len(EXPECTED_FILES):
-        for key in ("SDK_REPO", "SDK_REF"):
+        for key in ("SDK_REPO", "SDK_REF", "RUSTUP_TOOLCHAIN"):
             vals = {f: env_values(t, key) for f, t in texts.items()}
             flat = [v for vs in vals.values() for v in vs]
             if any(len(vs) != 1 for vs in vals.values()) or len(set(flat)) != 1:
@@ -415,6 +416,9 @@ def main(argv):
         for v in env_values(texts["release.yml"], "SDK_REF"):
             if not re.match(r"^[0-9a-f]{40}$", v):
                 problems.append("SDK_REF is not a 40-hex commit: %s" % v)
+        for v in env_values(texts["release.yml"], "RUSTUP_TOOLCHAIN"):
+            if not re.match(r"^'?[0-9]+\.[0-9]+\.[0-9]+'?$", v):
+                problems.append("RUSTUP_TOOLCHAIN is not an exact version: %s" % v)
 
         rel = texts["release.yml"]
         job = rel.find("\n  release:")

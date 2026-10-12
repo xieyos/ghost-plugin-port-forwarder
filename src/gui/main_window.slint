@@ -1,0 +1,582 @@
+// The standalone window: the same rules, statuses and editor as the management page
+// (ui/index.html), for running without Ghost. It judges nothing: gui.cpp sends every change
+// to App::Handle -- the page's API -- and shows what comes back.
+//
+// Licence: Slint is used under the Slint Royalty-free Desktop, Mobile, and Web Applications
+// License 2.0, whose attribution condition is the AboutSlint widget in an "About" dialog
+// reachable from the top-level menu: Help > About. Do not remove it.
+
+import { AboutSlint, Button, CheckBox, ComboBox, LineEdit, ListView, Palette } from "std-widgets.slint";
+
+export struct RuleRow {
+    id: string,
+    enabled: bool,
+    name: string,
+    proto: string,
+    route: string,
+    egress: string,
+    status: string,
+    status-detail: string,
+    status-kind: int,  // 0 listening, 1 idle, 2 a problem
+    conns: string,
+    conns-sub: string,
+    up: string,
+    down: string,
+    last-error: string,
+    last-error-at: string,
+}
+
+export struct Banner {
+    text: string,
+    error: bool,
+}
+
+// The window's own words; the plugin's codes arrive already in words (gui_view.cpp).
+export global Tr {
+    in property <bool> zh;
+    public pure function t(zh-text: string, en-text: string) -> string {
+        return zh ? zh-text : en-text;
+    }
+}
+
+global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <color> muted: dark ? #98a2b3 : #667085;
+    out property <color> ok: dark ? #4cc38a : #18794e;
+    out property <color> error: dark ? #ff8a7f : #c4291c;
+    out property <color> error-bg: dark ? #3a1d1b : #fde8e6;
+    out property <color> warn-fg: dark ? #f5d58a : #6b4a00;
+    out property <color> warn-bg: dark ? #3a2f12 : #fff4d6;
+    out property <color> info-bg: dark ? #1d2a3d : #e8f0fd;
+    out property <color> card: dark ? #1d2128 : #ffffff;
+    out property <color> line: dark ? #333944 : #d9dde5;
+    out property <color> scrim: dark ? #000000b0 : #00000060;
+}
+
+component Muted inherits Text {
+    color: Theme.muted;
+    font-size: 12px;
+}
+
+component Badge inherits Rectangle {
+    in property <string> text;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Theme.line;
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 1px;
+        padding-bottom: 1px;
+        Text {
+            text: root.text;
+            font-size: 11px;
+            color: Theme.muted;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component RuleCard inherits Rectangle {
+    in property <RuleRow> rule;
+    in property <bool> confirming;  // the delete confirmation shows
+    in property <bool> busy;
+    callback edit();
+    callback toggle();
+    callback ask-delete();
+    callback confirm-delete();
+    callback cancel-delete();
+
+    background: Theme.card;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.line;
+
+    HorizontalLayout {
+        padding: 12px;
+        spacing: 12px;
+
+        VerticalLayout {
+            spacing: 4px;
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: root.rule.name;
+                    font-size: 14px;
+                    font-weight: 600;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    min-width: 60px;
+                }
+                Badge { text: root.rule.proto; }
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 4px;
+                    background: root.rule.status-kind == 0 ? Theme.ok : root.rule.status-kind == 1 ? Theme.muted : Theme.error;
+                }
+                Text {
+                    text: root.rule.status;
+                    color: root.rule.status-kind == 0 ? Theme.ok : root.rule.status-kind == 1 ? Theme.muted : Theme.error;
+                    font-size: 13px;
+                }
+            }
+            Text {
+                text: root.rule.route + "    " + Tr.t("出口：", "Egress: ") + root.rule.egress;
+                font-size: 13px;
+                overflow: elide;
+            }
+            if root.rule.status-detail != "": Muted {
+                text: root.rule.status-detail;
+                overflow: elide;
+            }
+            HorizontalLayout {
+                spacing: 16px;
+                Muted { text: root.rule.conns + (root.rule.conns-sub == "" ? "" : "（" + root.rule.conns-sub + "）"); }
+                Muted { text: "↑ " + root.rule.up + "   ↓ " + root.rule.down; }
+                if root.rule.last-error != "": Text {
+                    text: root.rule.last-error + (root.rule.last-error-at == "" ? "" : "  " + root.rule.last-error-at);
+                    color: Theme.error;
+                    font-size: 12px;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+        }
+
+        VerticalLayout {
+          alignment: center;
+          HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+            if root.confirming: Text {
+                text: Tr.t("确定删除？", "Delete this rule?");
+                vertical-alignment: center;
+                color: Theme.error;
+            }
+            if root.confirming: Button {
+                text: Tr.t("删除", "Delete");
+                enabled: !root.busy;
+                clicked => { root.confirm-delete(); }
+            }
+            if root.confirming: Button {
+                text: Tr.t("取消", "Cancel");
+                clicked => { root.cancel-delete(); }
+            }
+            if !root.confirming: Button {
+                text: Tr.t("编辑", "Edit");
+                enabled: !root.busy;
+                clicked => { root.edit(); }
+            }
+            if !root.confirming: Button {
+                text: root.rule.enabled ? Tr.t("停用", "Disable") : Tr.t("启用", "Enable");
+                enabled: !root.busy;
+                clicked => { root.toggle(); }
+            }
+            if !root.confirming: Button {
+                text: Tr.t("删除", "Delete");
+                enabled: !root.busy;
+                clicked => { root.ask-delete(); }
+            }
+          }
+        }
+    }
+}
+
+// A label over its field.
+component Field inherits VerticalLayout {
+    in property <string> label;
+    spacing: 4px;
+    Text {
+        text: root.label;
+        font-size: 12px;
+        color: Theme.muted;
+    }
+    @children
+}
+
+component Card inherits Rectangle {
+    background: Palette.background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.line;
+    drop-shadow-blur: 24px;
+    drop-shadow-color: #00000040;
+}
+
+export component MainWindow inherits Window {
+    title: Tr.t("端口转发", "Port Forwarder");
+    icon: @image-url("../../icon.png");
+    preferred-width: 1000px;
+    preferred-height: 660px;
+    min-width: 760px;
+    min-height: 480px;
+    background: Palette.background;
+
+    in property <string> version;
+    in property <string> data-dir;
+    in property <[Banner]> banners;
+    in property <[RuleRow]> rules;
+    in property <bool> loading: true;  // no api/state answer yet
+    in property <bool> busy;           // a change is being saved
+    in-out property <string> pending-delete;  // the id whose delete confirmation shows
+    in-out property <string> toast-text;
+    in-out property <bool> toast-error;
+    in-out property <bool> about-open;
+
+    // The editor. gui.cpp fills it (open-editor) and reads it back (save).
+    in-out property <bool> editor-open;
+    in-out property <bool> editing-new;
+    in property <[string]> listen-labels;
+    in property <[string]> egress-labels;
+    in-out property <string> f-name;
+    in-out property <int> f-proto;  // 0 TCP, 1 UDP
+    in-out property <int> f-listen;  // index into listen-labels; 0 is 127.0.0.1
+    in-out property <string> f-listen-port;
+    in-out property <string> f-remote-host;
+    in-out property <string> f-remote-port;
+    in-out property <int> f-egress;  // index into egress-labels; 0 is direct
+    in-out property <string> f-max-conn;
+    in-out property <string> f-udp-idle;
+    in-out property <bool> f-enabled;
+    in-out property <bool> f-lan-ack;
+    in-out property <string> form-error;
+
+    callback add-rule();
+    callback edit-rule(string);
+    callback toggle-rule(string);
+    callback delete-rule(string);
+    callback save-rule();
+    callback exit-app();
+
+    MenuBar {
+        Menu {
+            title: Tr.t("文件", "File");
+            MenuItem {
+                title: Tr.t("新增规则", "Add rule");
+                activated => { root.add-rule(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: Tr.t("退出（停止所有转发）", "Exit (stops all forwarding)");
+                activated => { root.exit-app(); }
+            }
+        }
+        Menu {
+            title: Tr.t("帮助", "Help");
+            MenuItem {
+                title: Tr.t("关于", "About");
+                activated => { root.about-open = true; }
+            }
+        }
+    }
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            spacing: 10px;
+            Text {
+                text: Tr.t("端口转发", "Port Forwarder");
+                font-size: 20px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Badge {
+                text: Tr.t("独立运行", "Standalone");
+                y: (parent.height - self.height) / 2;
+                height: self.preferred-height;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: Tr.t("新增规则", "Add rule");
+                primary: true;
+                enabled: !root.loading && !root.busy;
+                clicked => { root.add-rule(); }
+            }
+            Button {
+                text: Tr.t("关于", "About");
+                clicked => { root.about-open = true; }
+            }
+        }
+
+        if root.loading: Muted {
+            text: Tr.t("正在启动…", "Starting…");
+        }
+
+        for b in root.banners: Rectangle {
+            background: b.error ? Theme.error-bg : Theme.info-bg;
+            border-radius: 6px;
+            HorizontalLayout {
+                padding: 10px;
+                Text {
+                    text: b.text;
+                    wrap: word-wrap;
+                    color: b.error ? Theme.error : Palette.foreground;
+                    font-size: 13px;
+                }
+            }
+        }
+
+        if !root.loading && root.rules.length == 0: Muted {
+            text: Tr.t("还没有规则。点“新增规则”添加第一条。", "No rules yet. Use “Add rule” to make the first one.");
+            font-size: 13px;
+        }
+
+        ListView {
+            vertical-stretch: 1;
+            for row in root.rules: VerticalLayout {
+                padding-bottom: 8px;
+                RuleCard {
+                    rule: row;
+                    busy: root.busy;
+                    confirming: root.pending-delete == row.id;
+                    edit => { root.pending-delete = ""; root.edit-rule(row.id); }
+                    toggle => { root.pending-delete = ""; root.toggle-rule(row.id); }
+                    ask-delete => { root.pending-delete = row.id; }
+                    confirm-delete => { root.pending-delete = ""; root.delete-rule(row.id); }
+                    cancel-delete => { root.pending-delete = ""; }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+            Muted {
+                text: Tr.t("数据目录：", "Data directory: ") + root.data-dir;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Muted {
+                text: Tr.t("关闭此窗口会停止所有转发。", "Closing this window stops all forwarding.");
+            }
+        }
+    }
+
+    // ---- The editor --------------------------------------------------------------------
+    if root.editor-open: Rectangle {
+        background: Theme.scrim;
+        TouchArea { }  // the list behind does not take clicks while the editor is open
+
+        editor := Card {
+            width: min(600px, parent.width - 32px);
+            height: min(form.preferred-height, parent.height - 32px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+
+            form := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+
+                Text {
+                    text: root.editing-new ? Tr.t("新增规则", "New rule") : Tr.t("编辑规则", "Edit rule");
+                    font-size: 16px;
+                    font-weight: 600;
+                }
+
+                GridLayout {
+                    spacing: 12px;
+                    Row {
+                        Field {
+                            label: Tr.t("名称", "Name");
+                            LineEdit { text <=> root.f-name; }
+                        }
+                        Field {
+                            label: Tr.t("协议", "Protocol");
+                            ComboBox {
+                                model: ["TCP", "UDP"];
+                                current-index <=> root.f-proto;
+                            }
+                        }
+                    }
+                    Row {
+                        Field {
+                            label: Tr.t("监听地址", "Listen address");
+                            ComboBox {
+                                model: root.listen-labels;
+                                current-index <=> root.f-listen;
+                            }
+                        }
+                        Field {
+                            label: Tr.t("监听端口", "Listen port");
+                            LineEdit {
+                                text <=> root.f-listen-port;
+                                input-type: number;
+                                placeholder-text: "1–65535";
+                            }
+                        }
+                    }
+                    Row {
+                        Field {
+                            label: Tr.t("远端主机", "Remote host");
+                            LineEdit {
+                                text <=> root.f-remote-host;
+                                placeholder-text: Tr.t("IP 地址或域名", "IP address or host name");
+                            }
+                        }
+                        Field {
+                            label: Tr.t("远端端口", "Remote port");
+                            LineEdit {
+                                text <=> root.f-remote-port;
+                                input-type: number;
+                                placeholder-text: "1–65535";
+                            }
+                        }
+                    }
+                    Row {
+                        Field {
+                            label: Tr.t("出口", "Egress");
+                            ComboBox {
+                                model: root.egress-labels;
+                                current-index <=> root.f-egress;
+                            }
+                        }
+                        if root.f-proto == 0: Field {
+                            label: Tr.t("最大连接数", "Max connections");
+                            LineEdit {
+                                text <=> root.f-max-conn;
+                                input-type: number;
+                                placeholder-text: "1–1024";
+                            }
+                        }
+                        if root.f-proto == 1: Field {
+                            label: Tr.t("UDP 空闲超时（秒）", "UDP idle timeout (s)");
+                            LineEdit {
+                                text <=> root.f-udp-idle;
+                                input-type: number;
+                                placeholder-text: "5–3600";
+                            }
+                        }
+                    }
+                }
+
+                CheckBox {
+                    text: Tr.t("启用", "Enabled");
+                    checked <=> root.f-enabled;
+                }
+
+                if root.f-egress != 0: Muted {
+                    text: Tr.t("经 Ghost 节点的规则只在 Ghost 中运行时有效；独立运行时不会监听。",
+                               "Rules through Ghost nodes only run inside Ghost; standalone they do not listen.");
+                    wrap: word-wrap;
+                }
+
+                if root.f-listen != 0: Rectangle {
+                    background: Theme.warn-bg;
+                    border-radius: 6px;
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: Tr.t("监听在非回环地址上：局域网内任何人都能经这个端口访问远端地址。Windows 防火墙可能会弹出提示，请只允许专用网络。",
+                                       "This rule listens beyond this computer: anyone on your local network can reach the remote address through this port. Windows Firewall may ask about it; allow private networks only.");
+                            wrap: word-wrap;
+                            color: Theme.warn-fg;
+                            font-size: 13px;
+                        }
+                        CheckBox {
+                            text: Tr.t("我已了解上述风险", "I understand");
+                            checked <=> root.f-lan-ack;
+                        }
+                    }
+                }
+
+                if root.form-error != "": Text {
+                    text: root.form-error;
+                    color: Theme.error;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: Tr.t("保存", "Save");
+                        primary: true;
+                        enabled: !root.busy;
+                        clicked => { root.save-rule(); }
+                    }
+                    Button {
+                        text: Tr.t("取消", "Cancel");
+                        clicked => {
+                            root.editor-open = false;
+                            root.form-error = "";
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- About (Help > About) -----------------------------------------------------------
+    if root.about-open: Rectangle {
+        background: Theme.scrim;
+        TouchArea {
+            clicked => { root.about-open = false; }
+        }
+
+        Card {
+            width: min(460px, parent.width - 32px);
+            height: min(about.preferred-height, parent.height - 32px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            TouchArea { }  // clicks inside the card do not close it
+
+            about := VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text {
+                    text: Tr.t("端口转发", "Port Forwarder") + " " + root.version;
+                    font-size: 16px;
+                    font-weight: 600;
+                }
+                Muted {
+                    text: Tr.t("把本机端口转发到远端地址。在 Ghost 中运行时可经 Ghost 的上游节点转发。",
+                               "Forwards local ports to remote hosts; inside Ghost, also through Ghost's upstream nodes.");
+                    wrap: word-wrap;
+                    font-size: 13px;
+                }
+                Muted {
+                    text: "MIT License · © 2026 xieyos · github.com/xieyos/ghost-plugin-port-forwarder";
+                    wrap: word-wrap;
+                }
+                AboutSlint { }
+                HorizontalLayout {
+                    alignment: end;
+                    Button {
+                        text: Tr.t("关闭", "Close");
+                        clicked => { root.about-open = false; }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Toast ------------------------------------------------------------------------------
+    if root.toast-text != "": Rectangle {
+        y: parent.height - self.height - 48px;
+        x: (parent.width - self.width) / 2;
+        width: min(toast.preferred-width, parent.width - 32px);
+        height: toast.preferred-height;
+        background: root.toast-error ? Theme.error-bg : Theme.card;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: root.toast-error ? Theme.error : Theme.line;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #00000030;
+        toast := HorizontalLayout {
+            padding: 10px;
+            padding-left: 16px;
+            padding-right: 16px;
+            Text {
+                text: root.toast-text;
+                color: root.toast-error ? Theme.error : Palette.foreground;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

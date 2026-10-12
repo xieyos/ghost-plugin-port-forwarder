@@ -195,6 +195,12 @@ const std::set<std::string>& AllowedDlls() {
     static const std::set<std::string> allowed = {
         "kernel32.dll", "advapi32.dll", "bcrypt.dll",   "iphlpapi.dll", "ole32.dll",
         "shell32.dll",  "user32.dll",   "winhttp.dll",  "ws2_32.dll",   "mswsock.dll",
+        // The standalone window (Slint, statically linked) and the Rust standard library
+        // under it: windowing and GDI, DirectWrite for text, UI Automation for screen
+        // readers, COM, and the Rust runtime's own.
+        "gdi32.dll", "dwmapi.dll", "uxtheme.dll", "imm32.dll", "comctl32.dll", "oleaut32.dll",
+        "dwrite.dll", "uiautomationcore.dll", "shcore.dll", "propsys.dll", "ntdll.dll", "userenv.dll",
+        "bcryptprimitives.dll", "api-ms-win-core-synch-l1-2-0.dll",
     };
     return allowed;
 }

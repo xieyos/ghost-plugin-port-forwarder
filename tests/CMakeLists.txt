@@ -51,6 +51,9 @@ pf_add_test(test_main_exe integration
   ARGS "$<TARGET_FILE:port-forwarder>" "${PROJECT_SOURCE_DIR}/manifest.json"
   DEPENDS port-forwarder
   LIBS pf_fake_ghost)
+# The standalone window's case waits for a window and a forwarded round trip on top of the
+# others' start-up and exit waits.
+set_tests_properties(test_main_exe PROPERTIES TIMEOUT 120)
 
 pf_add_test(test_api_policy unit
   SOURCES test_api_policy.cpp)
@@ -88,6 +91,11 @@ pf_add_test(test_ui_server functional
 pf_add_test(test_ui_source unit
   SOURCES test_ui_source.cpp
   ARGS "${PROJECT_SOURCE_DIR}/ui" "${PROJECT_SOURCE_DIR}/src")
+
+# What the standalone window shows and sends, without a window; its codes level with the page's.
+pf_add_test(test_gui_view unit
+  SOURCES test_gui_view.cpp
+  ARGS "${PROJECT_SOURCE_DIR}/ui")
 
 # The real exe hosted by a fake Ghost and then standalone, driven through its page API: three
 # kinds of rule end to end, fail-closed, restart, and what log.write carries.

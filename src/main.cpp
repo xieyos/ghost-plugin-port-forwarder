@@ -11,14 +11,19 @@
 //
 // Standalone (no Ghost; direct rules only, via-node rules show needs_ghost and do not
 // listen): data directory %LOCALAPPDATA%\<id>\ or --data-dir <dir>, one instance per data
-// directory (a named mutex), the page opened in the default browser unless --no-browser,
-// its address printed. Ctrl+C, closing the console window, or the page's Stop button
-// (POST api/quit) ends it the same way as the stop event. stdin is never read.
+// directory (a named mutex). How it is managed:
+//   (default)     a native window (gui.h); no page server. Closing the window, File > Exit,
+//                 Ctrl+C or closing the console window ends it.
+//   --web         the page, opened in the default browser, its address printed.
+//   --no-browser  the page, its address printed, nothing opened (no window either).
+// With the page, Ctrl+C, closing the console window, or the page's Stop button (POST
+// api/quit) ends it. Every way ends it the same way as the stop event. stdin is never read.
 
 #include "app.h"
 #include "applog.h"
 #include "build_info.h"
 #include "ghost_api.h"
+#include "gui.h"
 #include "host_handshake.h"
 #include "paths.h"
 #include "rule_store.h"
@@ -89,23 +94,29 @@ private:
     std::thread thread_;
 };
 
-// Standalone: Ctrl+C / Break / close set g_quit; main sets g_shutdownDone when it is done.
+// Standalone: Ctrl+C / Break / close set g_quit (and end the window's loop, if it runs);
+// main sets g_shutdownDone when it is done.
 HANDLE g_quit = nullptr;
 HANDLE g_shutdownDone = nullptr;
+
+void RequestQuit() {
+    if (g_quit) SetEvent(g_quit);
+    pf::GuiQuit();
+}
 
 BOOL WINAPI OnConsoleCtrl(DWORD type) {
     switch (type) {
         case CTRL_C_EVENT:
         case CTRL_BREAK_EVENT:
             // main carries on and shuts down; nothing to wait for here.
-            if (g_quit) SetEvent(g_quit);
+            RequestQuit();
             return TRUE;
         case CTRL_CLOSE_EVENT:
         case CTRL_LOGOFF_EVENT:
         case CTRL_SHUTDOWN_EVENT:
             // The process ends as soon as this returns: hold it, bounded, until main has
             // stopped the listeners and flushed the log.
-            if (g_quit) SetEvent(g_quit);
+            RequestQuit();
             if (g_shutdownDone) WaitForSingleObject(g_shutdownDone, kConsoleCloseWaitMs);
             return TRUE;
         default:
@@ -149,12 +160,13 @@ void LogStartup(const pf::LogFn& log, const pf::LoadResult& r, bool hosted) {
     }
 }
 
-void ShutDown(ExitDeadline& deadline, pf::App& app, pf::UiServer& ui, pf::AppLog& log,
+// `ui` is null when there is no page server (the standalone window).
+void ShutDown(ExitDeadline& deadline, pf::App& app, pf::UiServer* ui, pf::AppLog& log,
               const std::shared_ptr<pf::GhostApi>& api) {
     deadline.Arm(api);
     log.Write(pf::LogLevel::Info, "Port Forwarder stopping");
     app.Stop();  // listeners and connections, within the engine's 2 s
-    ui.Stop();
+    if (ui) ui->Stop();
     log.Stop();  // the last batch -- before the API it is sent through is shut down
     if (api) api->Shutdown();
 }
@@ -224,22 +236,27 @@ int RunHosted() {
     app->StartEngine();
 
     stop.WaitForever();
-    ShutDown(deadline, *app, ui, *log, api);
+    ShutDown(deadline, *app, &ui, *log, api);
     return 0;
 }
 
+enum class Manage { Window, Web, Headless };
+
 struct StandaloneArgs {
     std::wstring dataDir;  // "" = the default
-    bool noBrowser = false;
+    Manage manage = Manage::Window;
     std::string error;
 };
 
 StandaloneArgs ParseArgs(int argc, wchar_t** argv) {
     StandaloneArgs a;
+    bool web = false, noBrowser = false;
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg = argv[i];
         if (arg == L"--no-browser") {
-            a.noBrowser = true;
+            noBrowser = true;
+        } else if (arg == L"--web") {
+            web = true;
         } else if (arg == L"--data-dir") {
             if (i + 1 >= argc || argv[i + 1][0] == L'\0') {
                 a.error = "--data-dir needs a directory";
@@ -251,7 +268,48 @@ StandaloneArgs ParseArgs(int argc, wchar_t** argv) {
             return a;
         }
     }
+    // --no-browser keeps its meaning from before the window: the page, nothing opened.
+    if (noBrowser) {
+        a.manage = Manage::Headless;
+    } else if (web) {
+        a.manage = Manage::Web;
+    }
     return a;
+}
+
+// "zh-CN", "en-US": the user's UI language, for the window's words.
+std::string UiLanguageTag() {
+    wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+    if (LCIDToLocaleName(MAKELCID(GetUserDefaultUILanguage(), SORT_DEFAULT), name, LOCALE_NAME_MAX_LENGTH, 0) > 0) {
+        return pf::WideToUtf8(name);
+    }
+    return std::string();
+}
+
+// The window, run on this thread until it is closed. Returns after the window's last call
+// into the App has finished.
+void RunWindow(const std::shared_ptr<pf::App>& app, const std::wstring& dataDir) {
+    pf::GuiOptions go;
+    go.call = [app](const std::string& method, const std::string& path, const std::string& body) {
+        pf::UiRequest req;
+        req.method = method;
+        req.path = path;
+        req.body = body;
+        pf::GuiReply reply;
+        try {
+            const pf::UiResponse r = app->Handle(req);
+            reply.status = r.status;
+            reply.body = r.body;
+        } catch (...) {
+            reply.status = 500;
+            reply.body = std::string("{\"error\":\"") + pf::ui_err::kInternalError + "\"}";
+        }
+        return reply;
+    };
+    go.version = PF_VERSION;
+    go.dataDir = pf::WideToUtf8(dataDir);
+    go.langTag = UiLanguageTag();
+    pf::RunGui(go);
 }
 
 int RunStandalone(int argc, wchar_t** argv) {
@@ -260,7 +318,7 @@ int RunStandalone(int argc, wchar_t** argv) {
     const StandaloneArgs args = ParseArgs(argc, argv);
     if (!args.error.empty()) {
         pf::WriteLine(out, "port-forwarder: " + args.error +
-                               "\nusage: port-forwarder [--data-dir <dir>] [--no-browser]\n");
+                               "\nusage: port-forwarder [--data-dir <dir>] [--web | --no-browser]\n");
         return 2;
     }
     const std::wstring defaultDir = pf::DefaultStandaloneDataDir();
@@ -296,11 +354,27 @@ int RunStandalone(int argc, wchar_t** argv) {
     ao.hosted = false;
     ao.dataDir = dataDir;
     ao.log = logFn;
-    ao.onQuit = [] { SetEvent(g_quit); };
+    ao.onQuit = [] { RequestQuit(); };
     auto app = std::make_shared<pf::App>(ao);
 
     const pf::LoadResult loaded = app->LoadRules();
     log->Start();
+
+    if (args.manage == Manage::Window) {
+        LogStartup(logFn, loaded, false);
+        app->StartEngine();
+        pf::WriteLine(out, std::string("Port Forwarder ") + PF_VERSION +
+                               " -- running standalone, without Ghost. Close the window to exit.\n");
+        // Started from Explorer, the console is ours alone and would only sit behind the
+        // window: let it go. Started from a terminal, it stays, and Ctrl+C still ends us.
+        DWORD pids[2] = {};
+        if (GetConsoleProcessList(pids, 2) == 1) FreeConsole();
+        RunWindow(app, dataDir);
+        ShutDown(deadline, *app, nullptr, *log, nullptr);
+        SetEvent(g_shutdownDone);
+        CloseHandle(mutex);
+        return 0;
+    }
 
     pf::UiServerOptions uo;
     uo.handler = [app](const pf::UiRequest& r) { return app->Handle(r); };
@@ -309,7 +383,7 @@ int RunStandalone(int argc, wchar_t** argv) {
     std::string uiErr;
     if (!ui.Start(&uiErr)) {
         pf::WriteLine(out, "port-forwarder: the management page could not start: " + uiErr + "\n");
-        ShutDown(deadline, *app, ui, *log, nullptr);
+        ShutDown(deadline, *app, &ui, *log, nullptr);
         SetEvent(g_shutdownDone);
         CloseHandle(mutex);
         return 1;
@@ -321,7 +395,7 @@ int RunStandalone(int argc, wchar_t** argv) {
                            " -- running standalone, without Ghost. Press Ctrl+C to exit.\n"
                            "Management page: " +
                            ui.url() + "\n");
-    if (!args.noBrowser) {
+    if (args.manage == Manage::Web) {
         const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         const std::wstring url = pf::Utf8ToWide(ui.url());
         const HINSTANCE h = ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -332,7 +406,7 @@ int RunStandalone(int argc, wchar_t** argv) {
     }
 
     WaitForSingleObject(g_quit, INFINITE);
-    ShutDown(deadline, *app, ui, *log, nullptr);
+    ShutDown(deadline, *app, &ui, *log, nullptr);
     SetEvent(g_shutdownDone);
     CloseHandle(mutex);
     return 0;

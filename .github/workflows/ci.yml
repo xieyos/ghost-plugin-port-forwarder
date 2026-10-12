@@ -13,12 +13,16 @@ jobs:
     # windows-2022 is the image that still carries Visual Studio 2022 (17.x);
     # windows-latest has moved to an image without it.
     runs-on: windows-2022
-    timeout-minutes: 30
+    # Slint (the standalone window) is compiled from source, Rust and all.
+    timeout-minutes: 60
     env:
       # The public SDK whose packer the packing check runs -- the same commit release.yml
       # packs and signs with (tests/check_workflows.py keeps the two equal).
       SDK_REPO: liliBestCoder/ghost-plugin-sdk
       SDK_REF: bb0c51dc64587e0dbe898fd554593eb28438a11a
+      # The Rust toolchain that builds Slint -- the same one release.yml builds with
+      # (tests/check_workflows.py keeps the two equal).
+      RUSTUP_TOOLCHAIN: '1.97.0'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
@@ -35,6 +39,13 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: '3.12'
+
+      # rustup is on the image; RUSTUP_TOOLCHAIN makes every cargo and rustc below this one.
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --no-self-update
+          rustc --version
 
       # PF_REQUIRE_PACK_TEST: in CI a missing Python or SDK fails the packing check instead
       # of skipping it.
