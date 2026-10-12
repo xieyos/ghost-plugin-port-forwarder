@@ -269,23 +269,49 @@ void StandalonePageAndQuit() {
     CHECK(GetFileAttributesW((dir.path() + L"\\port-forwarder.log").c_str()) != INVALID_FILE_ATTRIBUTES);
 }
 
-// The visible top-level window of process `pid`, or null.
-HWND WindowOf(DWORD pid) {
+// The top-level windows of process `pid`.
+std::vector<HWND> WindowsOf(DWORD pid) {
     struct Find {
         DWORD pid;
-        HWND found;
-    } find = {pid, nullptr};
+        std::vector<HWND> found;
+    } find = {pid, {}};
     EnumWindows(
         [](HWND h, LPARAM lp) -> BOOL {
             auto* f = reinterpret_cast<Find*>(lp);
             DWORD owner = 0;
             GetWindowThreadProcessId(h, &owner);
-            if (owner != f->pid || !IsWindowVisible(h) || GetWindow(h, GW_OWNER) != nullptr) return TRUE;
-            f->found = h;
-            return FALSE;
+            if (owner == f->pid) f->found.push_back(h);
+            return TRUE;
         },
         reinterpret_cast<LPARAM>(&find));
     return find.found;
+}
+
+std::wstring TitleOf(HWND h) {
+    wchar_t title[64] = {};
+    GetWindowTextW(h, title, 64);
+    return title;
+}
+
+// The window the user sees: visible, titled with the app's name (in either language).
+HWND MainWindowOf(DWORD pid) {
+    for (HWND h : WindowsOf(pid)) {
+        const std::wstring t = TitleOf(h);
+        if (IsWindowVisible(h) && (t == L"Port Forwarder" || t == L"\u7aef\u53e3\u8f6c\u53d1")) return h;
+    }
+    return nullptr;
+}
+
+// Every top-level window of `pid` as "class 'title' visible|hidden", for a failure message.
+std::string DescribeWindows(DWORD pid) {
+    std::string out;
+    for (HWND h : WindowsOf(pid)) {
+        wchar_t cls[128] = {};
+        GetClassNameW(h, cls, 128);
+        out += pf::WideToUtf8(cls) + " '" + pf::WideToUtf8(TitleOf(h)) + "' " +
+               (IsWindowVisible(h) ? "visible" : "hidden") + "; ";
+    }
+    return out.empty() ? std::string("no windows") : out;
 }
 
 // Standalone, the default: the window. A direct rule from rules.json forwards while it is open;
@@ -323,12 +349,9 @@ void StandaloneWindow() {
     CHECK_MSG(line.find("http") == std::string::npos, "no page address: the window has no page server");
 
     HWND w = nullptr;
-    CHECK_MSG(pf_test::WaitUntil([&] { return (w = WindowOf(c.pid())) != nullptr; }, 20000), "a window opens");
+    const bool opened = pf_test::WaitUntil([&] { return (w = MainWindowOf(c.pid())) != nullptr; }, 20000);
+    CHECK_MSG(opened, ("a window titled Port Forwarder opens: " + DescribeWindows(c.pid())).c_str());
     if (!w) return;
-    wchar_t title[64] = {};
-    GetWindowTextW(w, title, 64);
-    const std::wstring t = title;
-    CHECK_MSG(t == L"Port Forwarder" || t == L"\u7aef\u53e3\u8f6c\u53d1", ("title: " + pf::WideToUtf8(t)).c_str());
 
     CHECK_MSG(pf_test::WaitUntil(
                   [&] {
@@ -340,7 +363,8 @@ void StandaloneWindow() {
 
     CHECK(PostMessageW(w, WM_CLOSE, 0, 0));
     DWORD code = 12345;
-    CHECK_MSG(c.ExitsWithin(5000, &code), "closing the window ends the process");
+    const bool exited = c.ExitsWithin(5000, &code);
+    CHECK_MSG(exited, ("closing the window ends the process: " + DescribeWindows(c.pid())).c_str());
     CHECK(code == 0);
     CHECK_MSG(pf_test::WaitUntil([&] { return pf_test::Refused(port); }, 3000), "and its rule with it");
 }
