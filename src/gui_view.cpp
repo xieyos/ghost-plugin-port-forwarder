@@ -13,8 +13,7 @@ using Pair = std::pair<const char*, const char*>;  // zh, en
 
 const char* Pick(const Pair& p, GuiLang lang) { return lang == GuiLang::Zh ? p.first : p.second; }
 
-// app.js's CODES, same wording. One difference: "bad_host" is both a rule_err code and a
-// ui_err code; the window never talks HTTP, so here it is always the rule's.
+// app.js's CODES, key for key and word for word (test_gui_view compares the two).
 const std::map<std::string, Pair>& Codes() {
     static const std::map<std::string, Pair> codes = {
         // rules.h -- rule_err
@@ -88,6 +87,7 @@ const std::map<std::string, Pair>& Codes() {
         {"tunnel_unavailable", {"Ghost 的隧道功能不可用", "Ghost's tunnels are unavailable"}},
         // ui_server.h -- ui_err (the window does not use HTTP; kept so that every code reads)
         {"bad_request", {"请求格式不对", "Malformed request"}},
+        {"bad_host_header", {"请求的主机名不对", "Wrong host name in the request"}},
         {"forbidden_origin", {"请求来源不被接受", "The request's origin is not accepted"}},
         {"bad_content_type", {"请求内容类型不对", "Wrong request content type"}},
         {"not_found", {"找不到", "Not found"}},

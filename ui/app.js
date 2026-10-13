@@ -186,7 +186,7 @@
     tunnel_unavailable: ["Ghost 的隧道功能不可用", "Ghost's tunnels are unavailable"],
     // ui_server.h -- ui_err
     bad_request: ["请求格式不对", "Malformed request"],
-    bad_host: ["请求的主机名不对", "Wrong host name in the request"],
+    bad_host_header: ["请求的主机名不对", "Wrong host name in the request"],
     forbidden_origin: ["请求来源不被接受", "The request's origin is not accepted"],
     bad_content_type: ["请求内容类型不对", "Wrong request content type"],
     not_found: ["找不到", "Not found"],
