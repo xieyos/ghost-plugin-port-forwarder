@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.0
+## 1.0.1
 
 - Standalone, `port-forwarder.exe` now opens a native window (Slint) instead of a browser
   page: the rules with their status and counters, the same editor and checks as the page
