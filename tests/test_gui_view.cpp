@@ -2,7 +2,7 @@
 //
 //   * The window can name every code the page can: each key of app.js's CODES table has its
 //     own text in GuiCodeText (test_ui_source keeps that table level with the plugin's code
-//     namespaces), in both languages. "bad_host" reads as the rule's error.
+//     namespaces), in both languages. "bad_host" is the rule's error.
 //   * api/state becomes rows and banners: routes (an IPv6 remote in brackets), egress,
 //     statuses and their kind, TCP and UDP counters, the last error with its count; the
 //     standalone banner, the damaged-rules-file banners. Mistyped fields read as empty.

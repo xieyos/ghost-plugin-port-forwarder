@@ -246,6 +246,8 @@ void HostMustBeExact() {
     CHECK(req("Host: 127.0.0.1:" + p + "\r\n").status == 200);
     const HttpReply rebinding = req("Host: evil.example:" + p + "\r\n");
     CHECK(rebinding.status == 400 && ErrorOf(rebinding) == pf::ui_err::kBadHost);
+    // Not the rule's code for a bad remote host: the page has one text per code.
+    CHECK(std::string(pf::ui_err::kBadHost) != pf::rule_err::kBadHost);
     CHECK(req("Host: localhost:" + p + "\r\n").status == 400);
     CHECK(req("Host: 127.0.0.1\r\n").status == 400);
     CHECK(req("Host: 127.0.0.1:" + std::to_string(rig->port + 1) + "\r\n").status == 400);

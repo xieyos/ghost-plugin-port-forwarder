@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0
 
 - Standalone, `port-forwarder.exe` now opens a native window (Slint) instead of a browser
   page: the rules with their status and counters, the same editor and checks as the page
@@ -13,6 +13,9 @@
   linked statically, so a release is still one exe. Slint is used under the Slint Royalty-free
   License 2.0 (AboutSlint in Help > About); its notices and those of its Rust dependencies are
   in THIRD_PARTY_NOTICES.txt.
+- Fixed: the management page answered a mistyped remote host with "Wrong host name in the
+  request" instead of the rule's own message. The page server's code for a wrong `Host`
+  header is now `bad_host_header`; `bad_host` is only the rule's.
 
 ## 1.0.0
 

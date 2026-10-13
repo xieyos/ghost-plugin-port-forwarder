@@ -167,6 +167,16 @@ void EveryCodeHasText(const std::string& js) {
     for (const std::string& c : codes) {
         CHECK_MSG(tail.find("\n    " + c + ": [") != std::string::npos, ("no text for code " + c).c_str());
     }
+    // One code, one text. A JavaScript object keeps the LAST of two equal keys without a word:
+    // "bad_host" was once both rule_err's (a bad remote host) and ui_err's (a wrong Host
+    // header) with a line each, and the page answered a mistyped remote host with "Wrong host
+    // name in the request". Namespaces may share a spelling only where they mean one thing.
+    for (const std::string& c : codes) {
+        const std::string key = "\n    " + c + ": [";
+        const size_t first = tail.find(key);
+        CHECK_MSG(first == std::string::npos || tail.find(key, first + 1) == std::string::npos,
+                  ("two texts for code " + c).c_str());
+    }
     CHECK(codes.size() > 60);
 }
 

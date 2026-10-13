@@ -73,7 +73,9 @@ constexpr uint16_t kGhostControlPort = 23551;
 // (ui/app.js), though a well-behaved page never sees most of them.
 namespace ui_err {
 constexpr const char* kBadRequest = "bad_request";              // 400: malformed request line or headers
-constexpr const char* kBadHost = "bad_host";                    // 400: Host is not exactly 127.0.0.1:<port>
+// Not "bad_host": that is rule_err's code for a bad remote host, and the page keeps one text
+// per code -- with both spelled alike, a mistyped remote host was reported as this one.
+constexpr const char* kBadHost = "bad_host_header";             // 400: Host is not exactly 127.0.0.1:<port>
 constexpr const char* kForbiddenOrigin = "forbidden_origin";    // 403: POST without our Origin
 constexpr const char* kBadContentType = "bad_content_type";     // 403: POST that is not application/json
 constexpr const char* kNotFound = "not_found";                  // 404
