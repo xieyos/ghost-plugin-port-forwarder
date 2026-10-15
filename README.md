@@ -1,8 +1,93 @@
-# Port Forwarder · 端口转发
-
-[中文](#中文) · [English](#english)
+# Port Forwarder
 
 <!-- Screenshot: the management page inside Ghost's plugin center (docs/screenshot.png, to be added). -->
+
+## English
+
+A Ghost Proxifier plugin (built on the [Ghost Proxifier plugin SDK](https://github.com/liliBestCoder/ghost-plugin-sdk)) that forwards local ports to remote hosts. Each rule is one listening port (TCP or UDP); its egress is **direct**, **Ghost's active upstream node**, or **a chosen Ghost node**. You manage it from Ghost's plugin center, or run it on its own without Ghost (direct only).
+
+Inspired by [Jackarain/portmap](https://github.com/Jackarain/portmap) -- one TCP mapping and a config file; its own to-do list (SOCKS5, web management, statistics, many mappings) is what this plugin does, except that the proxy half is Ghost's: **there is no proxy protocol code in this plugin**. For a via-node rule Ghost connects through the node and hands the connected socket over (permission `upstream.connect`); the plugin only moves bytes, and the node's address and credentials never leave Ghost.
+
+### Requirements
+
+- Windows 10 1607 / Server 2016 or later, x64. No Visual C++ redistributable needed (static CRT).
+- Hosted: Ghost Proxifier **1.2.1 or later** (`upstream.connect` first shipped there; an older Ghost refuses the package).
+- Standalone: no Ghost needed.
+
+### Install
+
+- **Plugin center**: once listed, install it from the Store tab of Ghost's plugins page and confirm the two permissions when enabling it: `upstream.connect` (open connections through your nodes) and `log.write` (write to Ghost's application log).
+- **Developer mode, local install**: turn on plugin developer mode in Ghost's settings, then use local install on the plugins page and pick `com.qtvz.xieyos.port-forwarder-<version>.gpkg` from a release. A local install skips the registry's signature checks -- only install packages you trust.
+
+### Rules
+
+| Field | Meaning |
+|---|---|
+| Name | 1-64 characters |
+| Protocol | TCP or UDP |
+| Listen | `127.0.0.1` (default: this machine only), `0.0.0.0` or one of this machine's IPv4 addresses; port 1-65535 |
+| Remote | IPv4, IPv6 (no brackets) or a host name; port 1-65535 |
+| Egress | Direct / follow Ghost's active node / a chosen node |
+| Limits | Max connections per rule (default 128, 1-1024); UDP idle timeout in seconds (default 60, 5-3600) |
+
+At most 64 rules; two enabled rules cannot share a (protocol, address, port), `0.0.0.0` conflicts with any address on the same port, and a rule that forwards to its own listener is refused. Each rule shows its status, active/total connections, bytes up/down and its last error.
+
+### Egress and UDP
+
+- **Direct**: the plugin resolves the remote host and connects itself.
+- **Through a node**: Ghost connects through the node and hands the connection over. **Fail closed**: when the node is unreachable or Ghost refuses or is unavailable, the client connection is closed -- **never retried directly**, which would quietly send the traffic from your real address.
+- **UDP through a node** needs a SOCKS5 node whose **UDP relay is enabled and verified in Ghost** (the UDP switch on the upstream page). If the node cannot relay, the rule's datagrams are dropped and counted.
+- Some nodes cannot relay UDP to a **host name**: if a UDP rule gets nothing back, try an IP address as the remote.
+- Hosted without `upstream.connect`, with Ghost unavailable, or standalone, a via-node rule **does not listen**; its status is `permission_missing`, `ghost_unavailable` or `needs_ghost`.
+
+### LAN exposure
+
+Listening on `0.0.0.0` or a LAN address lets **anyone on the network** reach the remote through that port -- for a via-node rule, that lends them your upstream node. A non-loopback address therefore cannot be saved without ticking the acknowledgement in the form.
+
+Windows Firewall asks the first time the plugin listens: **allow private networks only**. Every upgrade changes the install path (`plugins\<id>\<version>\`), so the firewall asks again.
+
+### Standalone
+
+Run `port-forwarder.exe` without Ghost (every [Release](https://github.com/xieyos/ghost-plugin-port-forwarder/releases/latest) carries it: one file, no installer, byte for byte the one inside the plugin package):
+
+- By default it opens a **native window** ([Slint](https://slint.dev/)): the rules with their status and counters; add, edit, enable, disable and delete -- the same as the management page in the plugin center; Help > About. **Closing the window stops all forwarding** (so does File > Exit).
+- `--web`: no window; the management page opens in the default browser instead (its address is also printed on the console). Ctrl+C or the page's Stop button ends it.
+- `--no-browser`: no window and no browser; only the management page (its address printed on the console), for unattended use. Ctrl+C or the page's Stop button ends it.
+- Direct rules only; via-node rules show `needs_ghost` and do not listen.
+- Data directory `%LOCALAPPDATA%\com.qtvz.xieyos.port-forwarder\` (rules in `rules.json`, log in `port-forwarder.log`, rolled at 1 MB x 2); `--data-dir <dir>` uses another one.
+- One instance per data directory.
+
+### Security
+
+- The management page listens on `127.0.0.1` only, under a random 128-bit path prefix made at every start; it checks `Host`, requires a same-origin `Origin` and `Content-Type: application/json` on writes, and its CSP lets only Ghost's page frame it (nobody, standalone).
+- The log never records client addresses, per-connection destinations, or the page's address.
+- A damaged rules file is kept under a new name (`rules.json.corrupt-<time>`); the plugin starts with no rules and the page says so.
+
+### Building from source
+
+Visual Studio 2022 ("Desktop development with C++"), CMake 3.21 or later, and [Rust](https://rustup.rs/) 1.92 or later (`x86_64-pc-windows-msvc`; CI pins it as `RUSTUP_TOOLCHAIN` in `.github/workflows/ci.yml`). Slint 1.18.1, the standalone window's toolkit, is fetched from GitHub at configure time (pinned to its commit) and compiled with its Rust dependencies (from Slint's own `Cargo.lock`) into the exe, statically -- the first build needs the network and takes a few minutes longer:
+
+```bash
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+The result is `build/Release/port-forwarder.exe`. The version has one source: `version` in `manifest.json`. The packing check (`test_pack`) needs Python 3.9+ and a checkout of [ghost-plugin-sdk](https://github.com/liliBestCoder/ghost-plugin-sdk) (by default `../ghost-plugin-sdk` next to this repository, or set `GHOST_PLUGIN_SDK` / `-DPF_GHOST_SDK_DIR=`); without them it shows as Skipped. When the checkout is a git repository, its HEAD must be the `SDK_REF` pinned in `.github/workflows/ci.yml`, or the check fails.
+
+### Releasing (maintainer)
+
+Push a `v<version>` tag: `.github/workflows/release.yml` builds, tests, packs and signs with the SDK's `gpkg.py`, and creates the GitHub Release with three assets (`ghost-plugin.json`, `ghost-plugin.json.sig`, the `.gpkg`). One-time setup:
+
+1. `python <sdk>/tools/plugin/gpkg.py keygen --out <a directory outside the repository>`;
+2. commit `dev-public.b64` at the repository root (the workflow verifies the signature with it, and checks before building that it exists and holds a 64-byte public key);
+3. store the whole of `dev-private.pem` as the repository secret `GHOST_DEV_KEY_PEM`, and keep the local copy offline.
+
+The private key never goes into the repository (`.gitignore` blocks `*.pem`, `*.key`, `.keys/`).
+
+### License
+
+MIT, see [LICENSE](LICENSE). Third party, see [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt): nlohmann/json (MIT); [Slint](https://slint.dev/), the standalone window's toolkit, used under the **Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0** -- which requires the `AboutSlint` widget in an About dialog reachable from the application's top-level menu (here: Help > About); keep it when changing the window. The licences of Slint's Rust dependencies are in the same file.
 
 ---
 
@@ -95,89 +180,3 @@ MIT，见 [LICENSE](LICENSE)。第三方见 [THIRD_PARTY_NOTICES.txt](THIRD_PART
 
 ---
 
-## English
-
-A Ghost Proxifier plugin (built on the [Ghost Proxifier plugin SDK](https://github.com/liliBestCoder/ghost-plugin-sdk)) that forwards local ports to remote hosts. Each rule is one listening port (TCP or UDP); its egress is **direct**, **Ghost's active upstream node**, or **a chosen Ghost node**. You manage it from Ghost's plugin center, or run it on its own without Ghost (direct only).
-
-Inspired by [Jackarain/portmap](https://github.com/Jackarain/portmap) -- one TCP mapping and a config file; its own to-do list (SOCKS5, web management, statistics, many mappings) is what this plugin does, except that the proxy half is Ghost's: **there is no proxy protocol code in this plugin**. For a via-node rule Ghost connects through the node and hands the connected socket over (permission `upstream.connect`); the plugin only moves bytes, and the node's address and credentials never leave Ghost.
-
-### Requirements
-
-- Windows 10 1607 / Server 2016 or later, x64. No Visual C++ redistributable needed (static CRT).
-- Hosted: Ghost Proxifier **1.2.1 or later** (`upstream.connect` first shipped there; an older Ghost refuses the package).
-- Standalone: no Ghost needed.
-
-### Install
-
-- **Plugin center**: once listed, install it from the Store tab of Ghost's plugins page and confirm the two permissions when enabling it: `upstream.connect` (open connections through your nodes) and `log.write` (write to Ghost's application log).
-- **Developer mode, local install**: turn on plugin developer mode in Ghost's settings, then use local install on the plugins page and pick `com.qtvz.xieyos.port-forwarder-<version>.gpkg` from a release. A local install skips the registry's signature checks -- only install packages you trust.
-
-### Rules
-
-| Field | Meaning |
-|---|---|
-| Name | 1-64 characters |
-| Protocol | TCP or UDP |
-| Listen | `127.0.0.1` (default: this machine only), `0.0.0.0` or one of this machine's IPv4 addresses; port 1-65535 |
-| Remote | IPv4, IPv6 (no brackets) or a host name; port 1-65535 |
-| Egress | Direct / follow Ghost's active node / a chosen node |
-| Limits | Max connections per rule (default 128, 1-1024); UDP idle timeout in seconds (default 60, 5-3600) |
-
-At most 64 rules; two enabled rules cannot share a (protocol, address, port), `0.0.0.0` conflicts with any address on the same port, and a rule that forwards to its own listener is refused. Each rule shows its status, active/total connections, bytes up/down and its last error.
-
-### Egress and UDP
-
-- **Direct**: the plugin resolves the remote host and connects itself.
-- **Through a node**: Ghost connects through the node and hands the connection over. **Fail closed**: when the node is unreachable or Ghost refuses or is unavailable, the client connection is closed -- **never retried directly**, which would quietly send the traffic from your real address.
-- **UDP through a node** needs a SOCKS5 node whose **UDP relay is enabled and verified in Ghost** (the UDP switch on the upstream page). If the node cannot relay, the rule's datagrams are dropped and counted.
-- Some nodes cannot relay UDP to a **host name**: if a UDP rule gets nothing back, try an IP address as the remote.
-- Hosted without `upstream.connect`, with Ghost unavailable, or standalone, a via-node rule **does not listen**; its status is `permission_missing`, `ghost_unavailable` or `needs_ghost`.
-
-### LAN exposure
-
-Listening on `0.0.0.0` or a LAN address lets **anyone on the network** reach the remote through that port -- for a via-node rule, that lends them your upstream node. A non-loopback address therefore cannot be saved without ticking the acknowledgement in the form.
-
-Windows Firewall asks the first time the plugin listens: **allow private networks only**. Every upgrade changes the install path (`plugins\<id>\<version>\`), so the firewall asks again.
-
-### Standalone
-
-Run `port-forwarder.exe` without Ghost (every [Release](https://github.com/xieyos/ghost-plugin-port-forwarder/releases/latest) carries it: one file, no installer, byte for byte the one inside the plugin package):
-
-- By default it opens a **native window** ([Slint](https://slint.dev/)): the rules with their status and counters; add, edit, enable, disable and delete -- the same as the management page in the plugin center; Help > About. **Closing the window stops all forwarding** (so does File > Exit).
-- `--web`: no window; the management page opens in the default browser instead (its address is also printed on the console). Ctrl+C or the page's Stop button ends it.
-- `--no-browser`: no window and no browser; only the management page (its address printed on the console), for unattended use. Ctrl+C or the page's Stop button ends it.
-- Direct rules only; via-node rules show `needs_ghost` and do not listen.
-- Data directory `%LOCALAPPDATA%\com.qtvz.xieyos.port-forwarder\` (rules in `rules.json`, log in `port-forwarder.log`, rolled at 1 MB x 2); `--data-dir <dir>` uses another one.
-- One instance per data directory.
-
-### Security
-
-- The management page listens on `127.0.0.1` only, under a random 128-bit path prefix made at every start; it checks `Host`, requires a same-origin `Origin` and `Content-Type: application/json` on writes, and its CSP lets only Ghost's page frame it (nobody, standalone).
-- The log never records client addresses, per-connection destinations, or the page's address.
-- A damaged rules file is kept under a new name (`rules.json.corrupt-<time>`); the plugin starts with no rules and the page says so.
-
-### Building from source
-
-Visual Studio 2022 ("Desktop development with C++"), CMake 3.21 or later, and [Rust](https://rustup.rs/) 1.92 or later (`x86_64-pc-windows-msvc`; CI pins it as `RUSTUP_TOOLCHAIN` in `.github/workflows/ci.yml`). Slint 1.18.1, the standalone window's toolkit, is fetched from GitHub at configure time (pinned to its commit) and compiled with its Rust dependencies (from Slint's own `Cargo.lock`) into the exe, statically -- the first build needs the network and takes a few minutes longer:
-
-```bash
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
-```
-
-The result is `build/Release/port-forwarder.exe`. The version has one source: `version` in `manifest.json`. The packing check (`test_pack`) needs Python 3.9+ and a checkout of [ghost-plugin-sdk](https://github.com/liliBestCoder/ghost-plugin-sdk) (by default `../ghost-plugin-sdk` next to this repository, or set `GHOST_PLUGIN_SDK` / `-DPF_GHOST_SDK_DIR=`); without them it shows as Skipped. When the checkout is a git repository, its HEAD must be the `SDK_REF` pinned in `.github/workflows/ci.yml`, or the check fails.
-
-### Releasing (maintainer)
-
-Push a `v<version>` tag: `.github/workflows/release.yml` builds, tests, packs and signs with the SDK's `gpkg.py`, and creates the GitHub Release with three assets (`ghost-plugin.json`, `ghost-plugin.json.sig`, the `.gpkg`). One-time setup:
-
-1. `python <sdk>/tools/plugin/gpkg.py keygen --out <a directory outside the repository>`;
-2. commit `dev-public.b64` at the repository root (the workflow verifies the signature with it, and checks before building that it exists and holds a 64-byte public key);
-3. store the whole of `dev-private.pem` as the repository secret `GHOST_DEV_KEY_PEM`, and keep the local copy offline.
-
-The private key never goes into the repository (`.gitignore` blocks `*.pem`, `*.key`, `.keys/`).
-
-### License
-
-MIT, see [LICENSE](LICENSE). Third party, see [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt): nlohmann/json (MIT); [Slint](https://slint.dev/), the standalone window's toolkit, used under the **Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0** -- which requires the `AboutSlint` widget in an About dialog reachable from the application's top-level menu (here: Help > About); keep it when changing the window. The licences of Slint's Rust dependencies are in the same file.
