@@ -1,16 +1,11 @@
 // One TCP forwarding rule at run time: a listener, an accept thread, and one pump thread
 // per connection.
 //
-// The remote end of a connection:
-//   direct     remote.host is resolved here (asynchronously, so a stop cancels the lookup:
-//              resolve.h), and the addresses are tried the RFC 8305 way -- families
-//              interleaved, the next attempt 250 ms after the previous (at once when it
-//              failed), the first to connect wins, and 2 s cover the whole set.
-//   via a node Ghost builds the connection through the user's upstream node and hands the
-//              socket over (TunnelSource::Open). ANY failure there closes the client's
-//              connection and records the code as lastError. There is no fallback to a
-//              direct connection, ever: a rule that says "through my proxy" must not send
-//              the user's traffic out from the real address because the proxy was down.
+// The remote end of a connection is opened by DialTcp (dialer.h): directly (RFC 8305), or
+// through a Ghost node (TunnelSource::Open). ANY failure there closes the client's
+// connection and records the code as lastError. There is no fallback to a direct
+// connection, ever: a rule that says "through my proxy" must not send the user's traffic
+// out from the real address because the proxy was down.
 //
 // The pump: both sockets non-blocking, select() in slices of kPollSliceMs (the stop flag is
 // checked after every slice), one 64 KB buffer per direction. Half-close is forwarded: when
@@ -47,6 +42,7 @@
 // What is never logged: client addresses and per-connection destinations.
 #pragma once
 
+#include "dialer.h"
 #include "forward_common.h"
 
 #include <winsock2.h>
@@ -60,8 +56,6 @@
 
 namespace pf {
 
-constexpr DWORD kDirectConnectTimeoutMs = 2000;
-constexpr DWORD kStaggerDelayMs = 250;  // RFC 8305's "Connection Attempt Delay"
 constexpr size_t kPumpBufferBytes = 64 * 1024;
 
 namespace detail {

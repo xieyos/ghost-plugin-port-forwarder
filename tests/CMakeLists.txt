@@ -75,6 +75,9 @@ pf_add_test(test_applog functional
   SOURCES test_applog.cpp
   LIBS pf_fake_ghost)
 
+pf_add_test(test_dialer functional
+  SOURCES test_dialer.cpp)
+
 pf_add_test(test_forward_tcp functional
   SOURCES test_forward_tcp.cpp
   LIBS pf_fake_ghost)
