@@ -1,6 +1,6 @@
 #include "forward_tcp.h"
 
-#include "resolve.h"
+#include "dialer.h"
 #include "util_str.h"
 
 #include <winsock2.h>
@@ -119,84 +119,6 @@ bool TryTakeGlobal(std::atomic<int>& g, int max) {
 
 std::atomic<int> g_acceptFaults{0};
 std::atomic<int> g_acceptFaultError{0};
-
-// Connects to remote.host the RFC 8305 way. The name is resolved first (a stop cancels the
-// lookup, see resolve.h). Then one attempt per address, in the resolver's order: the next
-// one starts kStaggerDelayMs after the previous, or at once when the previous failed, and
-// earlier attempts keep running -- the first to connect wins and the others are closed.
-// kDirectConnectTimeoutMs covers the whole set. Without the stagger a dead first address
-// costs the whole budget: "localhost" is ::1 first on most machines, and Windows retries a
-// refused loopback connect for about 2 s. "" and a connected, non-blocking socket, or a code.
-std::string ConnectDirect(TcpShared& s, UniqueSocket* out) {
-    std::vector<ResolvedAddr> addrs;
-    const std::string rc = ResolveHost(s.rule.remoteHost, s.rule.remotePort, SOCK_STREAM, s.stopEvent, &addrs);
-    if (!rc.empty()) return rc;
-    InterleaveFamilies(&addrs);
-
-    std::vector<UniqueSocket> pending;
-    size_t next = 0;
-    const uint64_t deadline = GetTickCount64() + kDirectConnectTimeoutMs;
-    uint64_t nextStartAt = 0;  // the first attempt starts at once
-    while (!s.stop.load()) {
-        const uint64_t now = GetTickCount64();
-        if (now >= deadline) break;
-        if (next < addrs.size() && now >= nextStartAt && pending.size() < FD_SETSIZE) {
-            const ResolvedAddr& a = addrs[next++];
-            UniqueSocket c(WSASocketW(a.family, SOCK_STREAM, IPPROTO_TCP, nullptr, 0,
-                                      WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT));
-            if (c && SetNonBlocking(c.get())) {
-                if (connect(c.get(), reinterpret_cast<const sockaddr*>(&a.addr), a.len) == 0) {
-                    *out = std::move(c);
-                    return std::string();
-                }
-                if (WSAGetLastError() == WSAEWOULDBLOCK) {
-                    pending.push_back(std::move(c));
-                    nextStartAt = now + kStaggerDelayMs;
-                    continue;
-                }
-            }
-            nextStartAt = now;  // this address failed at once: the next one now
-            continue;
-        }
-        if (pending.empty()) {
-            if (next >= addrs.size()) break;  // every address failed
-            continue;
-        }
-        uint64_t until = deadline;
-        if (next < addrs.size() && nextStartAt < until) until = nextStartAt;
-        uint64_t waitMs = until > now ? until - now : 0;
-        if (waitMs > kPollSliceMs) waitMs = kPollSliceMs;
-        fd_set w;
-        fd_set e;
-        FD_ZERO(&w);
-        FD_ZERO(&e);
-        for (const UniqueSocket& p : pending) {
-            FD_SET(p.get(), &w);
-            FD_SET(p.get(), &e);
-        }
-        timeval tv = {0, static_cast<long>(waitMs) * 1000};
-        const int n = select(0, nullptr, &w, &e, &tv);
-        if (n == SOCKET_ERROR) break;
-        for (size_t i = 0; n > 0 && i < pending.size();) {
-            const SOCKET ps = pending[i].get();
-            const bool writable = FD_ISSET(ps, &w) != 0;
-            if (!writable && !FD_ISSET(ps, &e)) {
-                ++i;
-                continue;
-            }
-            int err = 0;
-            int len = sizeof(err);
-            if (writable && getsockopt(ps, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len) == 0 &&
-                err == 0) {
-                *out = std::move(pending[i]);
-                return std::string();  // the other attempts close with `pending`
-            }
-            pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(i));
-            nextStartAt = 0;  // a failed attempt starts the next one at once
-        }
-    }
-    return fwd_err::kConnectFailed;
-}
 
 // One direction of a connection.
 struct Direction {
@@ -331,18 +253,9 @@ void ConnectionMain(std::shared_ptr<TcpShared> sp, SOCKET clientSock) {
     UniqueSocket client(clientSock);
     try {
         UniqueSocket remote;
-        std::string code;
-        if (!s.ViaNode()) {
-            code = ConnectDirect(s, &remote);
-        } else if (!s.ctx.tunnel) {
-            code = rule_status::kNeedsGhost;
-        } else {
-            TunnelResult t = s.ctx.tunnel->Open(s.rule.egress, s.rule.nodeId, Proto::Tcp, s.rule.remoteHost,
-                                                s.rule.remotePort);
-            code = t.code;
-            remote = std::move(t.sock);
-            if (code.empty() && !remote) code = fwd_err::kInternal;
-        }
+        const DialCancel cancel{&s.stop, s.stopEvent};
+        const std::string code = DialTcp(s.rule.egress, s.rule.nodeId, s.rule.remoteHost, s.rule.remotePort,
+                                         s.ctx.tunnel.get(), cancel, &remote);
         if (!code.empty()) {
             // Fail closed: the client connection is closed (by `client` going out of scope)
             // and nothing else is tried. A failure caused by our own stop is not an error.

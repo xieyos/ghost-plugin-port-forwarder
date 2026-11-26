@@ -483,6 +483,38 @@ void TestStopIsBounded() {
     CHECK_EQ(rig.echo.Connections(), 1);  // only the direct one
 }
 
+// A stop reaches a direct dial in progress: DialTcp gets the rule's stop flag and event and
+// checks them every slice. The remote is a closed loopback port, which Windows keeps
+// retrying for about kDirectConnectTimeoutMs -- so a dial that never hears of the stop holds
+// Stop() for that long. (Should a machine refuse at once, the precondition below says so
+// instead of the row passing for the wrong reason.)
+void TestStopInterruptsDirectDial() {
+    EngineOptions o;
+    Engine e(o);
+    pf_test::FailureContext ctx([&] { return Describe(e); });
+    pf_test::LoopbackListener closed;
+    CHECK(pf_test::ListenLoopback(&closed));
+    const int deadPort = closed.port;
+    closed.Close();
+    const int port = FreePort();
+    Apply(e, {MakeRule("r_0000000000000052", port, "127.0.0.1", deadPort)});
+    CHECK(Find(e, "r_0000000000000052").status == S::kListening);
+    UniqueSocket c = Connect(port);
+    CHECK(c.valid());
+    CHECK_UNTIL(Find(e, "r_0000000000000052").stats.activeConnections == 1, 2000, "the dial has started");
+    const auto before = Find(e, "r_0000000000000052").stats;
+    CHECK_MSG(before.activeConnections == 1 && before.lastError.code.empty(),
+              "precondition: the dial to the closed port is still in progress");
+
+    const ULONGLONG t0 = GetTickCount64();
+    e.Stop();
+    const ULONGLONG took = GetTickCount64() - t0;
+    std::printf("   Stop() took %llu ms\n", took);
+    CHECK_MSG(took < pf::kDirectConnectTimeoutMs / 2, "the dial heard the stop instead of running out its timeout");
+    CHECK_EQ(e.StragglerThreads(), 0);
+    CHECK_MSG(ClosedByPeer(c.get()), "Stop closes the client connection");
+}
+
 // A thread the engine cannot reach still does not hold Stop() past its budget, and it
 // finishes on its own later. Name resolution is the real case; here it is a 429 backoff
 // inside the API client, which nothing but GhostApi::Shutdown wakes. The gate clock keeps
@@ -911,6 +943,7 @@ int main() {
     run("via-node statuses", TestNodeStatuses);
     run("bind failure", TestBindFailure);
     run("stop is bounded", TestStopIsBounded);
+    run("stop interrupts a direct dial", TestStopInterruptsDirectDial);
     run("stop leaves a straggler behind", TestStopLeavesStragglerBehind);
     run("apply restarts only the changed rule", TestApplyRestartsOnlyChanged);
     run("direct: staggered connect", TestDirectStaggeredConnect);

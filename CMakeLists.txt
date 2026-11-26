@@ -142,6 +142,7 @@ add_link_options(/guard:cf /CETCOMPAT)
 add_library(pf_core STATIC
   src/app.cpp
   src/applog.cpp
+  src/dialer.cpp
   src/engine.cpp
   src/forward_tcp.cpp
   src/forward_udp.cpp
